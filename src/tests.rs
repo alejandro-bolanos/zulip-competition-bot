@@ -233,7 +233,7 @@ mod behaviour {
             timestamp: timestamp.to_string(),
             file_checksum: format!("sum-{}-{}", user_id, timestamp),
             file_path: "/tmp/x.csv".to_string(),
-            expected_gain: 1.0,
+            expected_gain: Some(1.0),
             actual_gain,
             tp: 1,
             tn: 1,

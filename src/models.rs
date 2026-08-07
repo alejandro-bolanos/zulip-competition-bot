@@ -29,7 +29,11 @@ pub struct Submission {
     pub timestamp: String,
     pub file_checksum: String,
     pub file_path: String,
-    pub expected_gain: f64,
+    /// `Some` in blind mode (typed at submit time). `None` in kaggle mode,
+    /// which no longer collects it -- the public gain is already visible in
+    /// the submit reply, so asking the student to also guess it ahead of
+    /// time added nothing.
+    pub expected_gain: Option<f64>,
     pub actual_gain: f64,
     pub tp: i32,
     pub tn: i32,

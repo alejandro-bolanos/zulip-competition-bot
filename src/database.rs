@@ -119,7 +119,7 @@ impl Database {
             timestamp: row.get(5)?,
             file_checksum: row.get(6)?,
             file_path: row.get(7)?,
-            expected_gain: row.get(8)?,
+            expected_gain: row.get::<_, Option<f64>>(8)?,
             actual_gain: row.get(9)?,
             tp: row.get(10)?,
             tn: row.get(11)?,
@@ -211,7 +211,7 @@ impl Database {
         &self,
         order_by: &str,
         mode: crate::config::CompetitionMode,
-    ) -> Result<Vec<(String, String, String, f64, f64, i32, Option<f64>, bool)>> {
+    ) -> Result<Vec<(String, String, String, f64, Option<f64>, i32, Option<f64>, bool)>> {
         let conn = self.get_connection()?;
 
         let query = match mode {
@@ -316,7 +316,7 @@ impl Database {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, f64>(3)?,
-                    row.get::<_, f64>(4)?,
+                    row.get::<_, Option<f64>>(4)?,
                     row.get::<_, i32>(5)?,
                     row.get::<_, Option<f64>>(6)?,
                     row.get::<_, i32>(7)? != 0,
@@ -366,16 +366,25 @@ impl Database {
     }
 
     /// Every pre-deadline kaggle candidate's PUBLIC gain, grouped by
-    /// competitor. Deliberately never selects `private_gain` or `user_email`:
-    /// this feeds the public leaderboard image, which is shown to the whole
-    /// class -- see `public_board.rs`'s privacy regression test.
+    /// competitor -- but ONLY for competitors currently `roster.is_enabled`:
+    /// a student removed from the roster mid-competition (or never on it --
+    /// e.g. a teacher account that submitted for testing) must not keep
+    /// appearing on a leaderboard image shown to the rest of the class.
+    /// `user_email` is read from each row ONLY to run that check; it is
+    /// never included in the returned tuple, so it never reaches
+    /// `public_board.rs` -- see that module's privacy regression test, and
+    /// `private_gain`, which this query never selects at all.
     /// `public_gain IS NOT NULL` scopes this to kaggle rows on its own; blind
     /// mode always stores `NULL` there.
-    pub fn get_public_candidates(&self) -> Result<Vec<(i64, String, String, f64)>> {
+    pub fn get_public_candidates(
+        &self,
+        roster: &crate::roster::Roster,
+    ) -> Result<Vec<(i64, String, String, f64)>> {
         let conn = self.get_connection()?;
         let mut stmt = conn.prepare(
             "SELECT user_id,
                     user_full_name,
+                    user_email,
                     COALESCE(batch_id, CAST(id AS TEXT)) AS batch_key,
                     public_gain
              FROM submissions
@@ -389,12 +398,17 @@ impl Database {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .filter(|(_, _, email, _, _)| roster.is_enabled(email))
+            .map(|(user_id, full_name, _email, batch_key, gain)| (user_id, full_name, batch_key, gain))
+            .collect())
     }
 
     /// Lowercased distinct emails with at least one submission, of any kind

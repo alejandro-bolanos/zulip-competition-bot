@@ -181,7 +181,7 @@ pub async fn process_submit(
         timestamp: Utc::now().to_rfc3339(),
         file_checksum: checksum,
         file_path,
-        expected_gain,
+        expected_gain: Some(expected_gain),
         actual_gain: gain_result.gain,
         tp: gain_result.tp,
         tn: gain_result.tn,
@@ -323,22 +323,21 @@ pub async fn process_kaggle_submit(
     };
     let after_deadline = Utc::now() > deadline;
 
+    // No `<expected_gain>` here, unlike blind mode's `submit`: the public
+    // gain is already shown in this very reply, so asking the student to
+    // also guess it ahead of time added nothing.
     let parts: Vec<&str> = message.content.trim().split_whitespace().collect();
-    if parts.len() < 3 {
-        return "❌ Incorrect format. Usage: `submit <submission_name> <expected_gain>` and attach one or more CSV files".to_string();
+    if parts.len() < 2 {
+        return "❌ Incorrect format. Usage: `submit <submission_name>` and attach one or more CSV files".to_string();
     }
     let submission_name = parts[1].to_string();
-    let expected_gain: f64 = match parts[2].parse() {
-        Ok(g) => g,
-        Err(_) => return "❌ The expected gain must be a number".to_string(),
-    };
 
     let links = match find_csv_links(&message.content) {
         Ok(l) => l,
         Err(e) => return format!("❌ Error parsing the message: {}", e),
     };
     if links.is_empty() {
-        return "❌ You must attach at least one CSV file. Use the format: `submit <name> <expected_gain>` and attach the CSVs.".to_string();
+        return "❌ You must attach at least one CSV file. Use the format: `submit <name>` and attach the CSVs.".to_string();
     }
     if links.len() as u32 > competitor.max_files_per_submission {
         return format!(
@@ -418,7 +417,7 @@ pub async fn process_kaggle_submit(
             timestamp: timestamp.clone(),
             file_checksum: checksum,
             file_path,
-            expected_gain,
+            expected_gain: None,
             actual_gain: private_result.gain,
             tp: private_result.tp,
             tn: private_result.tn,
@@ -472,6 +471,13 @@ pub async fn process_kaggle_submit(
     response
 }
 
+/// Formats an optional gain field for display -- `None` (a competitor with
+/// no valid entry, or kaggle mode's now-unused `expected_gain`) shows "N/A"
+/// rather than a fake number.
+fn fmt_gain(g: Option<f64>) -> String {
+    g.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "N/A".to_string())
+}
+
 /// Population mean and standard deviation (denominator N, not N-1): this is
 /// descriptive feedback about the student's own batch, not an estimate of
 /// some larger population, and N-1 would divide by zero for a single
@@ -511,34 +517,55 @@ pub fn process_list_submits(user_id: i64, db: &Database, config: &BotConfig) -> 
     }
 }
 
-/// Kaggle mode: shows only PUBLIC gain, per candidate -- never `actual_gain`
-/// (which mirrors the reveal-gated PRIVATE gain for kaggle rows). That value
-/// stays hidden until a teacher reads the leaderboard for this student's
-/// last pre-deadline batch; leaking it here, even after
-/// `results_reveal_date`, would bypass that entirely. Not gated by the
-/// reveal date at all -- public gain was already disclosed as an aggregate
-/// mean/std at submit time, so per-candidate detail isn't a new secret.
+/// Kaggle mode: one row per BATCH (submit call), showing the mean/std of its
+/// candidates' PUBLIC gain -- the same aggregate the submit reply itself
+/// showed, never any individual candidate's score. Never `actual_gain`
+/// either (which mirrors the reveal-gated PRIVATE gain for kaggle rows);
+/// that value stays hidden until a teacher reads the leaderboard for this
+/// student's last pre-deadline batch, and showing even one candidate's own
+/// gain here would leak strictly more than the aggregate already does. Not
+/// gated by the reveal date at all -- the aggregate was already disclosed at
+/// submit time, so repeating it here isn't a new secret.
 fn list_submits_kaggle(submissions: &[Submission]) -> String {
+    // Groups candidate rows into batches without assuming they're adjacent
+    // in `submissions` -- only that every row of one batch shares an
+    // identical timestamp (true by construction, see `process_kaggle_submit`)
+    // and that two different batches never share one (wall-clock, effectively
+    // impossible to collide). So the first time each batch_id is seen already
+    // reflects `submissions`' own order (timestamp DESC out of the DB); no
+    // separate sort is needed, and candidates within a batch may be
+    // collected in any relative order without changing what's displayed.
+    let mut batches: HashMap<String, Vec<&Submission>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for sub in submissions {
+        let key = sub
+            .batch_id
+            .clone()
+            .unwrap_or_else(|| sub.id.unwrap_or(0).to_string());
+        if !batches.contains_key(&key) {
+            order.push(key.clone());
+        }
+        batches.entry(key).or_default().push(sub);
+    }
+
     let mut response = "📋 **Your Submissions:**\n\n".to_string();
-    response.push_str("| ID | Name | 📅 Date | 💰 Expected | 📊 Public | 🆔 Submission | ⏰ |\n");
+    response.push_str("| Name | 📅 Date | 🔢 Candidates | 📊 Public mean | 📉 Public std | 🆔 Batch | ⏰ |\n");
     response.push_str("|---|---|---|---|---|---|---|\n");
 
-    for sub in submissions {
-        let deadline_mark = if sub.after_deadline { "⚠️" } else { "✅" };
-        let ts_str: String = sub.timestamp.chars().take(16).collect();
-        let public_str = sub
-            .public_gain
-            .map(|g| format!("{:.2}", g))
-            .unwrap_or_else(|| "N/A".to_string());
-        let batch_str = sub.batch_id.as_deref().unwrap_or("N/A");
+    for key in &order {
+        let rows = &batches[key];
+        let gains: Vec<f64> = rows.iter().filter_map(|s| s.public_gain).collect();
+        let (mean, std_dev) = mean_and_std(&gains);
+        let deadline_mark = if rows[0].after_deadline { "⚠️" } else { "✅" };
+        let ts_str: String = rows[0].timestamp.chars().take(16).collect();
         response.push_str(&format!(
-            "|{}|{}|{}|{:.2}|{}|`{}`|{}|\n",
-            sub.id.unwrap_or(0),
-            sub.submission_name,
+            "|{}|{}|{}|{:.2}|{:.2}|`{}`|{}|\n",
+            rows[0].submission_name,
             ts_str,
-            sub.expected_gain,
-            public_str,
-            batch_str,
+            rows.len(),
+            mean,
+            std_dev,
+            key,
             deadline_mark
         ));
     }
@@ -563,11 +590,11 @@ fn list_submits_blind(submissions: &[Submission], config: &BotConfig) -> String 
             let deadline_mark = if sub.after_deadline { "⚠️" } else { "✅" };
             let ts_str: String = sub.timestamp.chars().take(16).collect();
             response.push_str(&format!(
-                "|{}|{}|{}|{:.2}|{:.2}|{}|{}|\n",
+                "|{}|{}|{}|{}|{:.2}|{}|{}|\n",
                 sub.id.unwrap_or(0),
                 sub.submission_name,
                 ts_str,
-                sub.expected_gain,
+                fmt_gain(sub.expected_gain),
                 sub.actual_gain,
                 sub.threshold_category,
                 deadline_mark
@@ -582,11 +609,11 @@ fn list_submits_blind(submissions: &[Submission], config: &BotConfig) -> String 
             let deadline_mark = if sub.after_deadline { "⚠️" } else { "✅" };
             let ts_str: String = sub.timestamp.chars().take(16).collect();
             response.push_str(&format!(
-                "|{}|{}|{}|{:.2}|{}|{}|\n",
+                "|{}|{}|{}|{}|{}|{}|\n",
                 sub.id.unwrap_or(0),
                 sub.submission_name,
                 ts_str,
-                sub.expected_gain,
+                fmt_gain(sub.expected_gain),
                 sub.threshold_category,
                 deadline_mark
             ));
@@ -645,28 +672,25 @@ pub fn process_leaderboard_full(db: &Database, config: &BotConfig, order_by: &st
         config.competition.name,
         order_label
     );
-    response.push_str("| Pos | Name | TS | 💰 Chosen | 💰 Expected | 📊 Submissions | 📈 Max |\n");
+    response.push_str("| Pos | Name | TS | 💰 Final | 💰 Expected | 📊 Submissions | 📈 Max |\n");
     response.push_str("|---|---|---|---|---|---|---|\n");
 
     for (i, (name, email, ts, best_gain, expected_gain, total, max_gain, used_bullet)) in
         results.iter().enumerate()
     {
         if !config.teachers.contains(email) {
-            let max_str = max_gain
-                .map(|a| format!("{:.2}", a))
-                .unwrap_or_else(|| "N/A".to_string());
             let ts_str: String = ts.chars().take(16).collect();
             let bullet_mark = if *used_bullet { " 🌟" } else { "" };
             response.push_str(&format!(
-                "| {} | {}{} | {} | {:.2} | {:.2} | {} | {} |\n",
+                "| {} | {}{} | {} | {:.2} | {} | {} | {} |\n",
                 i + 1,
                 name,
                 bullet_mark,
                 ts_str,
                 best_gain,
-                expected_gain,
+                fmt_gain(*expected_gain),
                 total,
-                max_str
+                fmt_gain(*max_gain)
             ));
         }
     }
@@ -695,7 +719,7 @@ pub struct GradeRow {
 }
 
 struct LeaderboardEntry {
-    expected_gain: f64,
+    expected_gain: Option<f64>,
     timestamp: String,
     gain: f64,
     total_submissions: i32,
@@ -746,7 +770,7 @@ pub fn compute_grades(db: &Database, roster: &Roster, config: &BotConfig) -> Res
                 full_name: c.full_name.clone(),
                 gain: entry.map(|e| e.gain).unwrap_or(0.0),
                 grade: entry.map(|e| grade_for(e.gain, median, max)).unwrap_or(0.0),
-                expected_gain: entry.map(|e| e.expected_gain),
+                expected_gain: entry.and_then(|e| e.expected_gain),
                 timestamp: entry.map(|e| e.timestamp.clone()),
                 total_submissions: entry.map(|e| e.total_submissions).unwrap_or(0),
                 max_gain: entry.and_then(|e| e.max_gain),
@@ -808,14 +832,15 @@ fn build_grades_csv(rows: &[GradeRow]) -> Result<Vec<u8>> {
             row.full_name.as_str(),
             // Full precision -- `to_string()` on an f64 prints the shortest
             // round-trippable representation, not a fixed decimal count, so
-            // this is never rounded the way `format!("{:.N}", ...)` would be.
+            // none of these (including `grade` itself) are rounded the way
+            // `format!("{:.N}", ...)` would.
             &row.gain.to_string(),
             &row.expected_gain.map(|g| g.to_string()).unwrap_or_default(),
             row.timestamp.as_deref().unwrap_or(""),
             &row.total_submissions.to_string(),
             &row.max_gain.map(|g| g.to_string()).unwrap_or_default(),
             if row.used_golden_bullet { "yes" } else { "no" },
-            &format!("{:.2}", row.grade),
+            &row.grade.to_string(),
         ])?;
     }
     writer.flush()?;
@@ -862,11 +887,11 @@ pub fn process_user_submits(user_identifier: &str, db: &Database) -> String {
         let deadline_mark = if sub.after_deadline { "⚠️" } else { "✅" };
         let ts_str: String = sub.timestamp.chars().take(16).collect();
         response.push_str(&format!(
-            "|{}|{}|{}|{:.2}|{:.2}|{}|{}|\n",
+            "|{}|{}|{}|{}|{:.2}|{}|{}|\n",
             sub.id.unwrap_or(0),
             sub.submission_name,
             ts_str,
-            sub.expected_gain,
+            fmt_gain(sub.expected_gain),
             sub.actual_gain,
             sub.threshold_category,
             deadline_mark
@@ -917,7 +942,87 @@ pub fn process_no_submits(db: &Database, roster: &Roster) -> String {
 }
 
 
-pub fn process_all_submits(db: &Database) -> String {
+/// Every column `Submission` has, one row per stored candidate (kaggle mode's
+/// unit) or submission (blind mode's), plus `candidates_in_batch` -- computed
+/// here, not stored -- so a kaggle batch's size is visible on each of its own
+/// rows without a second lookup. Connects to the rest of the export via
+/// `batch_id`: every row sharing one is one submit call. `expected_gain`,
+/// `public_gain`, and `private_gain` are blank, not `0`, when the mode that
+/// produced this row never collects them (see `Submission`'s doc comments).
+fn build_all_submissions_csv(submissions: &[Submission]) -> Result<Vec<u8>> {
+    let mut batch_sizes: HashMap<&str, usize> = HashMap::new();
+    for sub in submissions {
+        if let Some(batch_id) = sub.batch_id.as_deref() {
+            *batch_sizes.entry(batch_id).or_insert(0) += 1;
+        }
+    }
+
+    let mut writer = csv::Writer::from_writer(vec![]);
+    writer.write_record([
+        "id",
+        "user_email",
+        "user_full_name",
+        "submission_name",
+        "timestamp",
+        "batch_id",
+        "candidates_in_batch",
+        "expected_gain",
+        "actual_gain",
+        "public_gain",
+        "private_gain",
+        "tp",
+        "tn",
+        "fp",
+        "fn",
+        "positives_predicted",
+        "threshold_category",
+        "file_checksum",
+        "file_path",
+        "after_deadline",
+        "used_golden_bullet",
+    ])?;
+
+    for sub in submissions {
+        let candidates_in_batch = match sub.batch_id.as_deref() {
+            Some(batch_id) => batch_sizes[batch_id],
+            None => 1,
+        };
+        writer.write_record([
+            sub.id.map(|i| i.to_string()).unwrap_or_default().as_str(),
+            sub.user_email.as_str(),
+            sub.user_full_name.as_str(),
+            sub.submission_name.as_str(),
+            sub.timestamp.as_str(),
+            sub.batch_id.as_deref().unwrap_or(""),
+            candidates_in_batch.to_string().as_str(),
+            sub.expected_gain.map(|g| g.to_string()).unwrap_or_default().as_str(),
+            sub.actual_gain.to_string().as_str(),
+            sub.public_gain.map(|g| g.to_string()).unwrap_or_default().as_str(),
+            sub.private_gain.map(|g| g.to_string()).unwrap_or_default().as_str(),
+            sub.tp.to_string().as_str(),
+            sub.tn.to_string().as_str(),
+            sub.fp.to_string().as_str(),
+            sub.fn_.to_string().as_str(),
+            sub.positives_predicted.to_string().as_str(),
+            sub.threshold_category.as_str(),
+            sub.file_checksum.as_str(),
+            sub.file_path.as_str(),
+            if sub.after_deadline { "yes" } else { "no" },
+            if sub.used_golden_bullet { "yes" } else { "no" },
+        ])?;
+    }
+
+    writer.flush()?;
+    Ok(writer.into_inner()?)
+}
+
+/// Builds the all-submissions CSV and uploads it to Zulip, on demand -- same
+/// shape as `export_grades_csv`. Replaces the old markdown-table version,
+/// which paginated into 50-row chunks joined by a literal `---PAGE_BREAK---`
+/// that nothing ever split on, so every page beyond the first arrived as
+/// unreadable raw text in one giant message; a file attachment has no such
+/// limit to page around.
+pub async fn export_all_submissions_csv(db: &Database, client: &ZulipClient) -> String {
     let submissions = match db.get_all_submissions() {
         Ok(s) => s,
         Err(e) => return format!("❌ Error retrieving submissions: {}", e),
@@ -927,88 +1032,21 @@ pub fn process_all_submits(db: &Database) -> String {
         return "📋 No submissions recorded in the system".to_string();
     }
 
-    // Group submissions by user_id
-    let mut submissions_by_user: HashMap<i64, Vec<&Submission>> = HashMap::new();
-    for sub in &submissions {
-        submissions_by_user
-            .entry(sub.user_id)
-            .or_insert_with(Vec::new)
-            .push(sub);
+    let csv_bytes = match build_all_submissions_csv(&submissions) {
+        Ok(b) => b,
+        Err(e) => return format!("❌ Error generating the submissions CSV: {}", e),
+    };
+
+    let filename = format!("all_submissions_{}.csv", Utc::now().format("%Y%m%d_%H%M%S"));
+    match client.upload_file(&filename, csv_bytes, "text/csv").await {
+        Ok(url) => format!(
+            "📋 **All submissions** ({} rows)\n\n[{}]({})",
+            submissions.len(),
+            filename,
+            url
+        ),
+        Err(e) => format!("❌ Error uploading the CSV to Zulip: {}", e),
     }
-
-    // Create a flat list with user submissions grouped together
-    let mut grouped_submissions = Vec::new();
-    let mut user_ids: Vec<_> = submissions_by_user.keys().collect();
-    user_ids.sort(); // Sort by user_id for consistent ordering
-
-    for user_id in user_ids {
-        if let Some(user_subs) = submissions_by_user.get(user_id) {
-            for sub in user_subs {
-                grouped_submissions.push(*sub);
-            }
-        }
-    }
-
-    // Paginate into chunks of 50 rows
-    const ROWS_PER_PAGE: usize = 50;
-    let total_pages = (grouped_submissions.len() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
-
-    let mut messages = Vec::new();
-
-    for (page_num, chunk) in grouped_submissions.chunks(ROWS_PER_PAGE).enumerate() {
-        let mut response = format!(
-            "📋 **All System Submissions (Page {}/{}):**\n\n",
-            page_num + 1,
-            total_pages
-        );
-        response.push_str("| ID | User | Name | 📅 Date | 💰 Expected | ✨ Actual | 🎯 | ⏰ |\n");
-        response.push_str("|---|---|---|---|---|---|---|---|\n");
-
-        let mut current_user_id = None;
-        
-        for sub in chunk {
-            // Add a visual separator when switching to a new user
-            if current_user_id.is_some() && current_user_id != Some(sub.user_id) {
-                response.push_str("|---|---|---|---|---|---|---|---|\n");
-            }
-            current_user_id = Some(sub.user_id);
-
-            let deadline_mark = if sub.after_deadline { "⚠️" } else { "✅" };
-            let ts_str: String = sub.timestamp.chars().take(16).collect();
-            let user_display = if sub.user_full_name.is_empty() {
-                &sub.user_email
-            } else {
-                &sub.user_full_name
-            };
-
-            response.push_str(&format!(
-                "|{}|{}|{}|{}|{:.2}|{:.2}|{}|{}|\n",
-                sub.id.unwrap_or(0),
-                user_display,
-                sub.submission_name,
-                ts_str,
-                sub.expected_gain,
-                sub.actual_gain,
-                sub.threshold_category,
-                deadline_mark
-            ));
-        }
-
-        if page_num < total_pages - 1 {
-            response.push_str(&format!("\n*Continued on page {}...*", page_num + 2));
-        } else {
-            response.push_str(&format!(
-                "\n\n**Total:** {} submissions from {} users",
-                grouped_submissions.len(),
-                submissions_by_user.len()
-            ));
-        }
-
-        messages.push(response);
-    }
-
-    // Join all messages with a delimiter that the caller can split on
-    messages.join("\n\n---PAGE_BREAK---\n\n")
 }
 
 // Helper functions
@@ -1294,7 +1332,7 @@ mod tests {
                 timestamp: ts.clone(),
                 file_checksum: format!("c{}", i),
                 file_path: "/tmp/x.csv".to_string(),
-                expected_gain: 1.0,
+                expected_gain: Some(1.0),
                 actual_gain: 1.0,
                 tp: 0,
                 tn: 0,
@@ -1331,7 +1369,7 @@ mod tests {
             timestamp: Utc::now().to_rfc3339(),
             file_checksum: format!("c{}", user_id),
             file_path: "/tmp/x.csv".to_string(),
-            expected_gain: gain,
+            expected_gain: Some(gain),
             actual_gain: gain,
             tp: 0,
             tn: 0,
@@ -1489,8 +1527,8 @@ mod tests {
         assert_eq!(
             csv,
             "email,name,gain,expected_gain,submission_date,submissions,max,golden_bullet,grade\n\
-             a@e.com,Ana,12.3456789,10,2025-01-01T00:00:00Z,3,20,yes,9.50\n\
-             b@e.com,Beto,0,,,0,,no,0.00\n"
+             a@e.com,Ana,12.3456789,10,2025-01-01T00:00:00Z,3,20,yes,9.5\n\
+             b@e.com,Beto,0,,,0,,no,0\n"
         );
     }
 
@@ -1556,7 +1594,7 @@ mod tests {
             timestamp: Utc::now().to_rfc3339(),
             file_checksum: format!("c-{}-{}", batch_id, public_gain),
             file_path: "/tmp/x.csv".to_string(),
-            expected_gain: 1.0,
+            expected_gain: Some(1.0),
             actual_gain: private_gain,
             tp: 0,
             tn: 0,
@@ -1604,7 +1642,7 @@ mod tests {
                 timestamp: start.to_rfc3339(),
                 file_checksum: format!("c{}", i),
                 file_path: "/tmp/x.csv".to_string(),
-                expected_gain: 1.0,
+                expected_gain: Some(1.0),
                 actual_gain: 1.0,
                 tp: 0,
                 tn: 0,

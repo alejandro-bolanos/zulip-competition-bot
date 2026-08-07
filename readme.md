@@ -171,8 +171,8 @@ Your final result is your **last** pre-deadline submission, not your best one �
 
 ### Students — kaggle mode
 
-- `submit <name> <expected_gain>` — submit one or more candidate CSVs (one Zulip message, multiple attachments = one entry). The reply shows only the mean and standard deviation of the *public* gain across your candidates — never any individual candidate's score.
-- `list submits` — list your own submissions
+- `submit <name>` — submit one or more candidate CSVs (one Zulip message, multiple attachments = one entry). No expected gain to type — the reply immediately shows the mean and standard deviation of the *public* gain across your candidates, never any individual candidate's score.
+- `list submits` — list your own submissions, one row per batch (candidate count and public mean/std, not per-candidate detail)
 - `help` — show this help
 
 Your final result is your **last** pre-deadline submission, not your best one — choose carefully what you send last. Within that submission, the candidate with the best *public* gain is the one scored against the *private* split.
@@ -194,7 +194,7 @@ Both modes share the same daily submission quota — in kaggle mode, one entry (
 - `duplicates` — list duplicate submissions (same file from two different accounts)
 - `leaderboard [gain|datetime]` — full leaderboard with statistics, sorted by gain or by date
 - `public leaderboard [top=N] [order=best|mean] [values=on|off] [range=MIN:MAX] [axis=on|off] [median=on|off]` — kaggle mode only, see [Public leaderboard image](#public-leaderboard-image)
-- `all submits` — every submission in the system
+- `all submits` — generate and upload a CSV of every submission in the system (every `Submission` column, plus a `candidates_in_batch` count)
 - `no submits` — roster members with no submissions at all
 - `user submits @user` — a specific user's submissions (use a real Zulip `@`-mention)
 - `roster reload` — reload the roster from disk without restarting the bot
@@ -207,7 +207,7 @@ Teachers cannot submit models themselves.
 
 **blind**: the classic mode. Each submission is one CSV, scored once against the whole dataset. Students only ever see which threshold category (and its message/GIF) their submission landed in, never the raw gain — they compete blind until `results_reveal_date`, or earlier via a golden bullet.
 
-**kaggle**: closer to a real Kaggle competition. `master_data.csv` is split into a public and a private portion. A submission can bundle several candidate CSVs at once; each is scored against both splits, but students only see the *public* side, and only as a batch mean/std, never per-candidate. There is no separate pick step — the leaderboard and grades use the competitor's **last** pre-deadline submission's best-on-public candidate's *private* gain, the same "last submission wins" rule blind mode uses. Golden bullets don't exist in this mode.
+**kaggle**: closer to a real Kaggle competition. `master_data.csv` is split into a public and a private portion. A submission can bundle several candidate CSVs at once; each is scored against both splits, but students only see the *public* side, and only as a batch mean/std, never per-candidate. There is no expected gain to type either — the public gain is already shown in the submit reply itself. There is no separate pick step — the leaderboard and grades use the competitor's **last** pre-deadline submission's best-on-public candidate's *private* gain, the same "last submission wins" rule blind mode uses. Golden bullets don't exist in this mode.
 
 ## Grading
 
@@ -223,14 +223,14 @@ The exported CSV mirrors the private leaderboard row for that same competitor, s
 
 ```csv
 email,name,gain,expected_gain,submission_date,submissions,max,golden_bullet,grade
-ana@example.com,Ana Gomez,132.5,120,2025-12-30T18:04:02Z,3,140,no,9.30
+ana@example.com,Ana Gomez,132.5,120,2025-12-30T18:04:02Z,3,140,no,9.25
 ```
 
-`gain` and `expected_gain` are written at full precision, never rounded. `submissions` and `max` are the same "total submissions" and "best-ever gain" columns `leaderboard` shows; `golden_bullet` marks whether the competitor's ranking submission was made with a golden bullet (always `no` in kaggle mode, where golden bullets don't exist). A competitor with no valid entry gets empty/zero values in every column except `email` and `name`, and a `grade` of `0.00`.
+`gain`, `expected_gain`, and `grade` are all written at full precision, never rounded to a fixed number of decimals. `expected_gain` is blank in kaggle mode, which doesn't collect it. `submissions` and `max` are the same "total submissions" and "best-ever gain" columns `leaderboard` shows; `golden_bullet` marks whether the competitor's ranking submission was made with a golden bullet (always `no` in kaggle mode, where golden bullets don't exist). A competitor with no valid entry gets empty/zero values in every column except `email` and `name`, and a `grade` of `0`.
 
 ## Public leaderboard image
 
-Kaggle mode only. Teachers generate a PNG leaderboard image with `public leaderboard`, safe to share directly with students — unlike `leaderboard`, it is built from a query that never selects `private_gain` or an email, only each competitor's Zulip display name and *public* gains. The bot uploads the PNG and DMs the teacher the link; the bot cannot post to a stream itself, so sharing it with the class is a manual step.
+Kaggle mode only. Teachers generate a PNG leaderboard image with `public leaderboard`, safe to share directly with students — unlike `leaderboard`, it is built from a query that never returns `private_gain` or an email, only each competitor's Zulip display name and *public* gains. That same query only considers competitors currently on the roster, so removing someone from `roster.csv` also removes them from this image, even if their old submissions are still in the database. The bot uploads the PNG and DMs the teacher the link; the bot cannot post to a stream itself, so sharing it with the class is a manual step.
 
 Each row shows a competitor's rank, display name (with `(n=K)` for their candidate count — shape height is normalized per row, so it alone can't tell a 3-candidate row from a 40-candidate one), and a shape summarizing the *public* gain of every candidate in their best-ever batch: a dot for a single candidate, a line for two, a smoothed triangle for three, and a filled density curve for four or more. No individual candidate ticks and no highlighted marker are ever drawn — the shape is the entire representation.
 
