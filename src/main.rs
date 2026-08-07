@@ -398,7 +398,7 @@ impl Bot {
             submission::process_leaderboard_full(&self.db, &self.config, order_by)
         } else if content == "all submits" && is_teacher {
             info!("Processing all submits command (teacher)");
-            submission::process_all_submits(&self.db)
+            submission::export_all_submissions_csv(&self.db, &self.client).await
         } else if content == "no submits" && is_teacher {
             info!("Processing no submits command (teacher)");
             submission::process_no_submits(&self.db, &self.roster.borrow())
@@ -477,9 +477,12 @@ impl Bot {
     /// Builds and uploads the public leaderboard PNG. Queries only
     /// `Database::get_public_candidates` -- never the private leaderboard --
     /// so this can never leak a private gain or an email; see
-    /// `public_board`'s module doc comment for why that matters.
+    /// `public_board`'s module doc comment for why that matters. Passing the
+    /// roster also means a competitor removed from it (or never on it) can
+    /// never appear on the image, even if old rows for them still sit in the
+    /// database.
     async fn generate_public_leaderboard(&self, opts: &public_board::BoardOptions) -> String {
-        let candidates = match self.db.get_public_candidates() {
+        let candidates = match self.db.get_public_candidates(&self.roster.borrow()) {
             Ok(c) => c,
             Err(e) => return format!("❌ Error retrieving public gains: {}", e),
         };
@@ -558,7 +561,7 @@ impl Bot {
                 • `duplicates` - List duplicate submissions\n\
                 • `leaderboard [gain|datetime]` - Full leaderboard with statistics (sorted by gain or date)\n\
                 {}\
-                • `all submits` - View every submission in the system\n\
+                • `all submits` - Generate and upload a CSV of every submission in the system\n\
                 • `no submits` - View roster members with no submission at all\n\
                 • `user submits @user` - View a user's submissions (use an @ mention)\n\
                 • `roster reload` - Reload the roster from the CSV\n\
@@ -599,8 +602,8 @@ impl Bot {
                     **Description:** {}\n\
                     **Deadline:** {}\n\n\
                     **Available commands:**\n\
-                    • `submit <name> <expected_gain>` - Submit one or more candidate CSVs (one submission). \
-                    You're shown the mean and standard deviation of the public gain across your candidates, not each one individually\n\
+                    • `submit <name>` - Submit one or more candidate CSVs (one submission; no expected gain to type -- \
+                    you're shown the mean and standard deviation of the public gain across your candidates right away, not each one individually)\n\
                     • `list submits` - List your submissions\n\
                     • `help` - Show this help\n\n\
                     **CSV format:** 1 column with the IDs you predict as positive (no header)\n\n\

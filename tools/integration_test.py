@@ -187,18 +187,20 @@ class Identity:
         return self.ask(bot_email, f"submit {name} {expected_gain}\n\n[{name}.csv]({uri})")
 
     def submit_many(
-        self, bot_email: str, name: str, expected_gain: float, candidates: dict[str, str]
+        self, bot_email: str, name: str, candidates: dict[str, str]
     ) -> str:
         """Kaggle mode: one message, several attachments -- `candidates` maps
         a distinct filename to its CSV body. This is exactly what a human
         attaching multiple files to one Zulip message produces: several
-        `[name](uri)` markdown links in one message body.
+        `[name](uri)` markdown links in one message body. No expected_gain --
+        kaggle mode's `submit` doesn't take one, since the public gain is
+        already shown in the very reply this call gets back.
         """
         links = [
             f"[{filename}]({self.upload(filename, body)})"
             for filename, body in candidates.items()
         ]
-        content = f"submit {name} {expected_gain}\n\n" + "\n".join(links)
+        content = f"submit {name}\n\n" + "\n".join(links)
         return self.ask(bot_email, content)
 
 
@@ -450,7 +452,6 @@ def phase_kaggle_before_deadline(
     reply = a.submit_many(
         bot,
         "model-a",
-        1000.0,
         {"weak.csv": fx.csv_from_ids(weak_ids), "strong.csv": fx.csv_from_ids(strong_ids)},
     )
     r.contains("submission accepted", reply, "submission received")
@@ -474,7 +475,6 @@ def phase_kaggle_before_deadline(
     reply = a.submit_many(
         bot,
         "bad",
-        1.0,
         {"ok.csv": fx.csv_from_ids(weak_ids), "bad.csv": f"{fx.unknown_id}\n"},
     )
     r.contains("unknown id in one candidate rejects the whole submission", reply, "Invalid IDs")
@@ -483,7 +483,7 @@ def phase_kaggle_before_deadline(
     # limit for this student -- read from roster.csv, not hardcoded, so this
     # stays correct regardless of how the fixture roster is set up.
     too_many = {f"c{i}.csv": fx.csv_from_ids(weak_ids) for i in range(a_max_files + 1)}
-    reply = a.submit_many(bot, "many", 1.0, too_many)
+    reply = a.submit_many(bot, "many", too_many)
     r.contains("too many candidate files in one submission is rejected", reply, "Too many files")
 
     # B never submits in this phase -- exercises "no submits".
@@ -505,13 +505,26 @@ def phase_kaggle_before_deadline(
         f"{expected_private:.2f}",
     )
 
-    # A student's own `list submits` must show public gain (already known to
-    # them) but never the private gain the leaderboard just displayed.
+    # A student's own `list submits` shows the batch's AGGREGATE public gain
+    # (already known to them, same mean the submit reply itself showed) --
+    # never an individual candidate's own score, and never the private gain
+    # the leaderboard just displayed.
     reply = a.ask(bot, "list submits")
     r.contains(
-        "list submits shows the public gain",
+        "list submits shows the batch's aggregate public mean",
         reply,
-        f"{fx.public_gain(strong_ids):.2f}",
+        f"{expected_public_mean:.2f}",
+    )
+    # Structural check, not a value comparison: on the real master dataset
+    # weak_ids and strong_ids can coincidentally land on the same public
+    # gain (e.g. if every id beyond the first happens to fall in the
+    # PRIVATE split), which would make an "excludes this number" check
+    # meaningless. Counting rows is coincidence-proof: aggregated by batch,
+    # a 2-candidate submission is exactly one table row, never two.
+    r.check(
+        "list submits shows ONE row for the batch, not one per candidate",
+        reply.count("|model-a|") == 1,
+        f"expected exactly one '|model-a|' row in:\n{reply}",
     )
     r.excludes(
         "list submits never shows the private gain",
@@ -530,7 +543,7 @@ def phase_kaggle_after_deadline(r: Results, bot: str, a: Identity, fx: Fixtures)
     print("\n== Kaggle mode: after the deadline ==")
 
     late_ids = fx.prediction_ids(2, 0)
-    reply = a.submit_many(bot, "late", 1.0, {"late.csv": fx.csv_from_ids(late_ids)})
+    reply = a.submit_many(bot, "late", {"late.csv": fx.csv_from_ids(late_ids)})
     r.contains("late submission is flagged", reply, "LATE SUBMISSION")
 
 
