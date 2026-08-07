@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Copy to integration_config.json and fill in. That file holds API keys, so",
+    "keep it out of git.",
+    "",
+    "bot_config points at the config the bot under test is RUNNING with. The",
+    "script reads the gain matrix, master data and both competition dates from",
+    "it, so they cannot drift out of sync with what it asserts.",
+    "",
+    "The two students must be regular user accounts, not bots: `no submits`",
+    "filters bots out, so a bot student makes that assertion meaningless. Give",
+    "them the same display_name if you also want to exercise the namesake",
+    "isolation path.",
+    "",
+    "The teacher may be your own account, and must appear in the bot config's",
+    "`teachers` list."
+  ],
+
+  "site": "https://uba25.zulip.rebelare.com",
+  "bot_config": "config-test.json",
+
+  "students": [
+    {
+      "email": "test-alumno-1@example.com",
+      "api_key": "...",
+      "display_name": "Alumno Uno"
+    },
+    {
+      "email": "test-alumno-2@example.com",
+      "api_key": "...",
+      "display_name": "Alumno Dos"
+    }
+  ],
+
+  "teacher": {
+    "email": "profesor@example.com",
+    "api_key": "...",
+    "display_name": "Profesor"
+  }
+}

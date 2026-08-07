@@ -1,0 +1,117 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project
+
+Zulip bot for Kaggle-style ML competitions, in Rust. Students DM the bot a CSV of predicted-positive IDs; the bot scores them against a master dataset using a configurable gain matrix and tracks a leaderboard. `competition.mode` picks between two quite different pipelines — `blind` (default: one CSV per submit, only a threshold category is revealed) and `kaggle` (multiple candidate CSVs per submit, scored against a public/private split, the LAST pre-deadline submit is always the one that counts) — see "Kaggle mode" below.
+
+The package and binary are `zulip-competition-bot`; the library crate is `zulip_competition_bot` (Cargo's underscore form), which is what `use` statements reference.
+
+## Commands
+
+```bash
+cargo build --release
+cargo test
+cargo test test_gain_calculation    # single test (unit tests live in src/tests.rs and inline in src/submission.rs)
+cargo clippy
+```
+
+`tools/` is a separate uv-managed Python project (its own `pyproject.toml` / `uv.lock`), unrelated to the Cargo workspace. It holds `integration_test.py`, an end-to-end test that drives a running bot instance through real Zulip DMs — see [tools/README.md](tools/README.md). Run with `uv run` from inside `tools/`; nothing there affects the Rust build.
+
+Run the bot:
+
+```bash
+RUST_LOG=info cargo run -- run --config config.json
+```
+
+Requires a real `roster.csv` (5 columns: `email,name,daily_limit,golden_bullets,max_files_per_submission`) at `roster.path`, and a `master_data.csv` at `master_data.path` — the bot refuses to boot without either. If `competition.mode` is `"kaggle"`, `master_data.csv` additionally needs a third `split` column (`public`/`private`) — see "Kaggle mode" below.
+
+`RUST_LOG` drives the `tracing` env-filter; default is `info`. Logs go to both stdout (compact) and `logs/zulip_competition_bot_YYYYMMDD.log` (detailed, appended).
+
+Generate a config template (writes/overwrites `./config.json`):
+
+```bash
+cargo run -- create-config
+```
+
+Verify Zulip connectivity — checks credentials, sends a test DM, registers an event queue, fetches events. Reads `config.json` from the current directory and prompts on stdin:
+
+```bash
+cargo run --bin diagnose
+```
+
+## Architecture
+
+Single-process async bot. `main.rs` owns a `Bot` struct holding config, Zulip client, database handle, and master data, and runs an infinite poll loop over Zulip's event queue (`get_events`, 500ms sleep between polls, 5s backoff on error).
+
+Data flow for a submission in **blind mode** (`submission::process_submit` — kaggle mode's is different, see "Kaggle mode" below):
+
+1. `main.rs` computes `is_teacher` (`config.teachers`, by email), `is_competitor` (roster membership), and `mode` (`config.competition.mode`, decides `process_submit` vs. `process_kaggle_submit`). Anyone who is neither teacher nor competitor gets a single rejection banner and the dispatch chain never runs — see "Authorization" below.
+2. `process_submit` looks up the sender's `Competitor` (passed in by `main.rs`, already resolved) and checks the daily submit quota (`count_submissions_today`) *before* touching the network or filesystem — a rejected/malformed attempt never reaches `db.save_submission`, so it never spends quota. If invoked as `reveal` (`use_golden_bullet: true`), it also checks `db.get_golden_bullets_used` the same way, before spending anything.
+3. The CSV attachment is found by regex against the *message markdown* (`[name.csv](url)`), then downloaded with basic auth. There is no attachment API call; a message without a markdown CSV link is rejected.
+4. The file is written under `submissions/{students,teachers}/<sanitized name>/<timestamp>_<name>_<file>`, and SHA-256 hashed.
+5. IDs are parsed (single column, no header) and validated against `MasterData::all_ids` — any unknown ID rejects the whole submission.
+6. Gain is computed by iterating *all* master IDs to build a confusion matrix, then `TP*tp + TN*tn + FP*fp + FN*fn_` from `config.gain_matrix`.
+7. The gain maps to a `gain_thresholds` category (highest `min_gain` at or below the score wins), which supplies the response message and a random GIF.
+8. Everything is inserted into SQLite; the reply is built inline as Zulip markdown, with a quota footer (`used+1/limit`) appended.
+
+Module responsibilities:
+
+- `config.rs` — the whole `config.json` schema as serde structs, plus the template generator and `validate()`. Adding a config key means touching all three. `BotConfig::load` validates, so the bot refuses to start on config that would fail later.
+- `master_data.rs` — loads `master_data.csv` (`id,label`, header expected) once at startup into two `HashSet<i32>`s (all IDs, positive IDs). Held in memory for the process lifetime. An optional third `split` column (`public`/`private`) additionally partitions into `public_ids`/`private_ids` — required for kaggle mode (checked in `main.rs` right after loading, since `config.validate()` runs before master data is even read), ignored otherwise. The csv crate itself enforces that every row has the same column count as the header, so `has_split` is decided once from the header, not re-derived per row.
+- `roster.rs` — loads `roster.csv` (`email,name,daily_limit,golden_bullets,max_files_per_submission`, header required, keyed by lowercased email) once at startup into a `HashMap`. **Required, not optional** — `Roster::load` failing refuses to boot, same as a missing `master_data.csv`. `golden_bullets` is the competitor's total golden-bullet budget for the whole competition — a flat CSV number, not a per-day quota, and not itself decremented; how many are *spent* is derived from `submissions` (see below). `max_files_per_submission` only matters in kaggle mode (max candidate CSVs per submission); loaded and validated regardless of mode, since the roster schema doesn't change with `competition.mode`.
+- `database.rs` — SQLite via `rusqlite` (bundled). Opens a **fresh connection per method call**; there is no pool, and there are no transactions anywhere, including across a kaggle batch's N inserts — a crash mid-batch can in principle leave it partially stored; this is a pre-existing property of the whole module, not something kaggle mode newly introduces. `submissions` is created with `CREATE TABLE IF NOT EXISTS` (there used to be a second `chosen_batches` table backing an explicit `choose` command; both are gone now that a competitor's final submission is always their last pre-deadline one). There is still no general migration framework, but `init()` has a hand-written step per added column: `ALTER TABLE submissions ADD COLUMN ...` that no-ops (via a caught "duplicate column name" error) on any DB that already has the column, including brand-new ones. Follow this same pattern — add-the-column-then-swallow-the-duplicate-error, listed in the `migration` array in `init()` — for the next column addition rather than introducing a different migration mechanism. Every full-row `SELECT` shares one mapper, `Database::row_to_submission`, so the 20-column layout exists in exactly one place.
+- `zulip.rs` — thin REST client (form-encoded, not JSON — Zulip requires this). Owns the event-queue state: `queue_id` **and** `last_event_id` are set together by `register_queue` and dropped together on any non-success response. Keep them coupled — event ids are only meaningful within one queue, so carrying an id across a re-register makes every later fetch fail and the bot goes permanently deaf. `upload_file` (multipart, `/api/v1/user_uploads`) is the only outbound file transfer; it checks both `url` and `uri` in the response since the field name varies by Zulip server version.
+- `submission.rs` — all command handlers and all response formatting. This is where the business logic lives.
+- `models.rs` — Zulip wire types and the `Submission` row struct. The Zulip-user-directory types (`ZulipUser`, presence) were removed once `no submits` moved to the roster — don't reintroduce a per-user Zulip API sweep without a strong reason.
+- `public_board.rs` — the `public leaderboard` command (kaggle mode only): `build_rows` (pure, groups candidates and picks each competitor's representative batch), `render_svg` (a plain string, which is what makes it unit-testable), `rasterize_png` (via `resvg`/`usvg`/`fontdb`, since Zulip does not render SVG inline), and `parse_options` for the command's `key=value` arguments. **Never queries or renders `private_gain` or an email** — see the module doc comment and the "Public leaderboard privacy" gotcha below.
+
+## Authorization
+
+Two independent lists, checked once per message in `handle_message`, before dispatch:
+
+- `config.teachers` (emails) → `is_teacher`.
+- `self.roster` (loaded from `roster.csv`) → `is_competitor`, via case-insensitive email lookup.
+
+Neither → a single banner (`🚫 You are not authorized...`) and the message is dropped right there; the dispatch `if/else` chain, `help` included, never runs. This is deliberate: someone off the roster should not learn the command surface exists.
+
+`self.roster` is a `RefCell<Roster>`, not a lock — safe because `run()` fully awaits one message before starting the next (no `tokio::spawn` anywhere in this crate), so at most one borrow is ever live. **If message handling is ever parallelized, this needs a real lock instead.** `roster reload` (teacher-only) is the sole writer; a parse error on reload keeps the previous roster in effect rather than locking everyone out. Note `process_submit` takes an already-resolved `&Competitor`, not `&Roster` — the lookup happens in `main.rs` and is cloned out of the `RefCell` borrow *before* the `.await`, specifically so no `Ref` guard is ever held across an await point (clippy will flag this immediately if reintroduced — `await_holding_refcell_ref`).
+
+## Kaggle mode
+
+`competition.mode` (`"blind"` default, or `"kaggle"`) switches the whole submit/rank/grade pipeline. The two modes share the roster, the daily quota, config, and the database, but diverge in almost everything else:
+
+- **Submit.** Blind: `submission::process_submit`, one message = one CSV = one row, gain computed once against the whole dataset (`MasterData::all_ids`). Kaggle: `submission::process_kaggle_submit`, one message = one or more CSV attachments = one submission, capped at `competitor.max_files_per_submission`. Every candidate is downloaded and validated (CSV format, unknown ids) *before* anything is stored — one bad candidate rejects the whole submission, so a batch is never partially saved (modulo the no-transactions caveat above). Each stored candidate row gets a shared `batch_id` (`"{user_id}-{timestamp_micros}"`) and both `public_gain` (against `MasterData::public_ids`) and `private_gain` (against `private_ids`) via `calculate_gain_over` — the general form `calculate_gain` now wraps. `actual_gain` mirrors `private_gain`; `threshold_category` is a fixed `"kaggle"` marker, since blind mode's categories don't apply.
+- **What the student sees.** Only the batch's mean and standard deviation of *public* gain (`mean_and_std`, population formula — divides by N, not N-1, so a single-candidate submission gets a clean std of 0 instead of a NaN from dividing by zero) — never any individual candidate's score, public or private. The reply also carries the `batch_id`, useful to correlate with `list submits`.
+- **Selecting a final submission.** There is no explicit pick step — kaggle mode uses the exact same "last submission wins automatically" rule as blind mode: a competitor's final entry is always their LAST pre-deadline batch. (An earlier version required an explicit `choose <batch_id>` command backed by a `chosen_batches` table; both are gone. A submit alone is now enough to get a leaderboard/grade entry.)
+- **Ranking and grading.** `Database::get_leaderboard` branches its whole SQL body on `mode`, but returns the *same* 8-column tuple shape either way, so `process_leaderboard_full` and `compute_grades` don't need to know which mode is active. The kaggle branch first picks each user's LAST pre-deadline batch (`final_batch`, a `ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY timestamp DESC, id DESC)`, joined back on `COALESCE(batch_id, CAST(id AS TEXT))` — never on `batch_id` directly, since `NULL = NULL` is false in SQL and that would silently drop any row), then within that batch picks the candidate with the best `public_gain` and reports *its* `private_gain` as `final_gain` — the private gain of the best-on-public candidate of the LAST batch wins. `total_submissions` in both branches counts `COUNT(DISTINCT COALESCE(batch_id, id))` — distinct submissions, not raw candidate rows; a no-op in blind mode where `batch_id` is always `NULL`, and the fix that keeps a kaggle competitor's submission count from being inflated by however many candidates each batch happened to have.
+- **Daily quota still counts submissions, not files.** `count_submissions_today` collapses same-day rows by `batch_id.unwrap_or(id)` before counting — this is what makes submissions count per submission event (not per file) hold in kaggle mode despite one submission being N rows in `submissions`.
+- **No golden bullets.** `reveal` is rejected outright in kaggle mode (checked in `main.rs` before the teacher/competitor split, so neither role can reach it): public gain is already visible on every submit, and private gain is exactly the value `results_reveal_date` is supposed to gate — a bullet would let a student see their own graded value early, which is a materially different (and not agreed-to) leak.
+
+## Conventions and gotchas
+
+- **English throughout**: all user-facing bot output, code, logs, and identifiers are English. Keep new response strings in English.
+- **Private messages only.** The loop ignores anything where `msg_type != "private"`, and skips the bot's own messages by email comparison.
+- **Commands are matched on a lowercased copy** of the content, but arguments are re-parsed from the original `message.content` to preserve case. Preserve this split when adding commands.
+- **One clock, not two.** `competition.timezone_offset_minutes` (minutes to *add* to UTC for local time, e.g. `-180` for Argentina; defaults to `0` so pre-existing configs keep meaning UTC) governs *both* how naive datetime strings are interpreted *and* the calendar-day boundary for the daily submit quota (`CompetitionConfig::local_day_bounds_utc`). Don't add a second, differently-scoped offset — that was explicitly rejected in favor of a single shared clock.
+- **Two independent date gates.** `competition.deadline` marks a submission `after_deadline` (stored, excluded from the leaderboard, but still accepted). `competition.results_reveal_date` controls whether students see actual gain in `list submits`. Both accept RFC3339 (its own offset always wins) or naive `%Y-%m-%dT%H:%M:%S` (read at `timezone_offset_minutes`) via `parse_config_datetime`, and both are validated at startup — use `CompetitionConfig::deadline_utc()` / `results_reveal_utc()` rather than re-parsing the strings.
+- **Students never see actual gain** before the reveal date — only their own expected gain and the threshold category. Don't add actual gain to student-facing output without checking `results_revealed`.
+- **Teachers cannot submit** (blocked in `main.rs`), even though `process_submit` still has an `is_teacher` branch.
+- **Daily submit quota** (`competitor.daily_submit_limit`, from the roster) is checked in `process_submit` via `count_submissions_today`, which counts *stored* submissions in `[day_start, day_end)` of the local calendar day — a rejected/invalid attempt (bad CSV, unknown ids, missing attachment) never reaches storage and so never spends quota. Late (post-deadline) submissions *do* still count against it. The check deliberately reuses `get_user_submissions` + in-Rust date filtering rather than a SQL range query on the stringified `timestamp` column, because `to_rfc3339()`'s fractional-second width isn't fixed, so lexicographic string comparison of two timestamps isn't guaranteed to match chronological order.
+- In **blind mode**, `leaderboard` ranks by each user's *most recent pre-deadline* submission (`final_gain`), not their best — `max_gain` is reported alongside as a separate column. Teachers are filtered out of the rendered table, not the SQL. **This same rule is documented in both help texts** — keep it that way if a grade export or similar ever reads from the same query, since the two must not silently diverge. Kaggle mode's ranking rule is different — see "Kaggle mode" above.
+- **Golden bullets** (`competitor.golden_bullets`, from the roster) let a student see their actual gain and threshold category immediately, bypassing `results_reveal_date` for that one reply — via `reveal <name> <expected_gain>`, which is `submit` with `use_golden_bullet: true` threaded through (same CSV/quota/gain pipeline, same daily quota gate too — the two limits are independent and both checked). Spent bullets are **not** a separate counter: `used_golden_bullet` is a column on `submissions`, and `Database::get_golden_bullets_used` counts flagged rows for that user, so it can never drift from what's actually stored (same "derive, don't duplicate" reasoning as `get_distinct_submitter_emails`). Like the daily quota, only a *stored* submission spends a bullet — a rejected/malformed `reveal` attempt spends nothing. `get_leaderboard` exposes whether the *chosen* (last valid pre-deadline) submission itself used a bullet, rendered as a 🌟 next to the name in `leaderboard`; this is per-submission, not "has this user ever used one".
+- `user submits` requires a real Zulip `@**Name**` mention; the regex will not match a plain email or bare name.
+- `no submits` lists roster members with zero submissions of any kind (`Database::get_distinct_submitter_emails` vs. `Roster::competitors()`), not "who hasn't been active in Zulip" — there is no more presence lookup.
+- **Grade export (`grades`, teacher-only)** is on-demand, not automatic — `submission::compute_grades` runs synchronously off the *same* `get_leaderboard("gain", mode)` rows the leaderboard itself uses (so a grade and its leaderboard row can never disagree), then `submission::export_grades_csv` uploads the CSV via `ZulipClient::upload_file` and replies with a markdown link. Formula: `grade = 8 + 2*(gain − median)/(max − median)`, floored at 0; median and max are computed only over roster competitors with a valid pre-deadline submission, with `config.teachers` excluded from that set. Anyone without one (zero submissions, or only after-deadline ones) gets a flat 0. If median equals max (single submitter, or ≥half already at the top score) the division is skipped: max scores 10, anything else scores 8. `GradeRow` carries the full leaderboard row along, not just the bare gain — `compute_grades` groups it into a `LeaderboardEntry` per email before folding it into `GradeRow`. Exported columns: `email,name,gain,expected_gain,submission_date,submissions,max,golden_bullet,grade` — `gain` and `expected_gain` are written via `f64::to_string()`, not `format!("{:.N}", ...)`, specifically to avoid rounding; only `grade` (the computed 0–10 score) keeps a fixed 2 decimals. Like the submit arm, the `grades` handler computes grades (and drops the roster's `RefCell` borrow) *before* the upload's `.await`.
+- **Per-message panic isolation.** `handle_message_isolated` wraps each handler in `catch_unwind`, so a panic costs one message instead of the process. Don't remove it, and don't rely on it either — it cannot resume the handler, so the user only gets a generic error.
+- **Truncate strings by `chars()`, never by byte slicing.** Output includes emoji; `&s[..n]` panics when `n` lands mid-character.
+- `error.rs` defines a `BotError` enum that nothing uses — the codebase runs on `anyhow` throughout. Prefer `anyhow` unless you intend to migrate.
+- `src/tests.rs` holds two modules. `behaviour` exercises the real functions (config validation, the leaderboard SQL, per-user isolation) and is where new tests belong. The legacy `tests` module re-implements logic inline, so it passes regardless of the implementation — treat it as worthless coverage.
+- `process_all_submits` paginates into 50-row chunks joined by a literal `---PAGE_BREAK---` marker, but `main.rs` sends the result as a single message without splitting on it. Splitting is unimplemented.
+- **Public leaderboard privacy (`public_board.rs`, kaggle mode only).** `Database::get_public_candidates` is the ONLY query this feature is allowed to use — it selects `public_gain` and never `private_gain` or `user_email`, by construction, not by convention. Never wire `public_board::build_rows`/`render_svg` to a query or a struct field that could carry a private gain or an email; `public_board::tests::rendered_svg_never_contains_private_data_or_emails` is the regression test for this and should be treated as load-bearing, not relaxed. `build_rows` picks each competitor's **representative batch** — the one containing their best-ever public candidate — so a row's drawn shape and its rank number are always consistent with each other; this is deliberately independent of which batch is the *grading* one (the LAST pre-deadline batch, see "Kaggle mode" above), since the public board and the private leaderboard answer different questions and are allowed to disagree.
+- **Public leaderboard rendering.** Shape by candidate count `n`, drawn with NO individual ticks and NO best/mean marker ever, per the shape being the entire representation: 1 → a dot, 2 → a straight line, 3 → a smoothed triangle (quadratic Béziers, not straight edges), 4+ → a Gaussian KDE (Silverman bandwidth) filled curve. Every row is normalized to its own height budget, so shape height is NOT comparable across rows — `(n=K)` next to the name exists specifically to compensate for that. SVG is rasterized to PNG (`rasterize_png`) because Zulip does not render SVG inline; the embedded `assets/fonts/DejaVuSans.ttf` (public-domain-ish Bitstream Vera license, see `assets/fonts/LICENSE_DEJAVU`) is loaded into a fresh `fontdb::Database` rather than relying on system fonts, so output doesn't vary between machines — its family name must keep matching the `font-family` `render_svg` writes into the SVG, or text silently fails to render with no error. When writing raw SVG inside a Rust string literal, use `r##"..."##` (two hashes), not `r#"..."#` — a plain `#RRGGBB` color right after an opening quote (`fill="#333333"`) forms the exact `"#` sequence that closes a single-hash raw string early, breaking the rest of the literal into unrelated tokens.
+
+## Repository state
+
+`.gitignore` excludes `config.json` (live Zulip API key), `config-test.json`, `master_data.csv` (the competition ground truth), `roster.csv` (real student names/emails), `*.db`, `logs/`, `submissions/`, and `target/`. `roster.example.csv` (schema template, fake data) and `master_data.csv`'s absence are both expected in a fresh checkout — several tests skip themselves when the real files aren't present rather than failing.

@@ -1,0 +1,8 @@
+[project]
+name = "zulip-competition-bot-tools"
+version = "0.1.0"
+description = "Test and diagnostic scripts for zulip-competition-bot, run via a real Zulip realm"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.34.2",
+]
