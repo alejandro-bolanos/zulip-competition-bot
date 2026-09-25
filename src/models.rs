@@ -56,6 +56,16 @@ pub struct Submission {
     /// turns out to be their LAST pre-deadline submission -- there is no
     /// separate pick step, see `Database::get_leaderboard`.
     pub private_gain: Option<f64>,
+    /// Kaggle mode only: a teacher's reference model, uploaded with
+    /// `baseline <name>` rather than `submit`. Never ranked, graded, or
+    /// counted as a competitor anywhere -- only ever shown as a marked,
+    /// unnumbered row alongside the competitors.
+    pub is_baseline: bool,
+    /// Whether this baseline appears on the public leaderboard image. Set per
+    /// batch by `baseline publish`/`baseline hide`; always `false` for
+    /// competitor rows. Private views (`leaderboard`, `baseline list`) show
+    /// every baseline regardless.
+    pub baseline_published: bool,
 }
 
 #[derive(Debug, Clone)]

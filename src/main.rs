@@ -13,6 +13,7 @@ use std::path::Path;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use config::{BotConfig, CompetitionMode};
+use submission::BaselineCommand;
 use database::Database;
 use master_data::MasterData;
 use roster::Roster;
@@ -364,13 +365,49 @@ impl Bot {
             }
         } else if (content.starts_with("submit ") || content.starts_with("reveal ")) && is_teacher {
             info!("Submit command blocked for teacher");
-            "⚠️ Teachers cannot submit models. Use the administration commands instead.".to_string()
+            match mode {
+                CompetitionMode::Kaggle => "⚠️ Teachers cannot submit models. To upload a reference model, use \
+                    `baseline <name>` and attach the CSVs -- it's never ranked or graded."
+                    .to_string(),
+                CompetitionMode::Blind => {
+                    "⚠️ Teachers cannot submit models. Use the administration commands instead.".to_string()
+                }
+            }
         } else if content == "list submits" && !is_teacher {
             info!("Processing list submits command");
             submission::process_list_submits(message.sender_id, &self.db, &self.config)
         } else if content == "duplicates" && is_teacher {
             info!("Processing duplicates command (teacher)");
             submission::process_duplicates(&self.db)
+        } else if content.split_whitespace().next() == Some("baseline") && is_teacher {
+            info!("Processing baseline command (teacher)");
+            if mode != CompetitionMode::Kaggle {
+                "❌ `baseline` is only available in kaggle mode.".to_string()
+            } else {
+                // Re-parsed from the original text so the name and id keep
+                // their case; "baseline" itself is the same length either way.
+                let args = &message.content.trim()["baseline".len()..];
+                match submission::parse_baseline_command(args) {
+                    BaselineCommand::Upload(name) => {
+                        submission::process_baseline_upload(
+                            &message,
+                            &self.config,
+                            &self.db,
+                            &self.master_data,
+                            name,
+                        )
+                        .await
+                    }
+                    BaselineCommand::List => submission::process_baseline_list(&self.db),
+                    BaselineCommand::Publish(id) => {
+                        submission::process_baseline_visibility(&self.db, id, true)
+                    }
+                    BaselineCommand::Hide(id) => {
+                        submission::process_baseline_visibility(&self.db, id, false)
+                    }
+                    BaselineCommand::Usage => submission::baseline_usage(),
+                }
+            }
         } else if content.starts_with("public leaderboard") && is_teacher {
             info!("Processing public leaderboard command (teacher)");
             if mode != CompetitionMode::Kaggle {
@@ -385,7 +422,7 @@ impl Bot {
             }
         } else if content.starts_with("leaderboard") && is_teacher {
             info!("Processing leaderboard command (teacher)");
-            let parts: Vec<&str> = message.content.trim().split_whitespace().collect();
+            let parts: Vec<&str> = message.content.split_whitespace().collect();
             let order_by = if parts.len() >= 2 {
                 match parts[1].to_lowercase().as_str() {
                     "datetime" => "datetime",
@@ -487,12 +524,24 @@ impl Bot {
             Err(e) => return format!("❌ Error retrieving public gains: {}", e),
         };
 
-        let rows = public_board::build_rows(&candidates, opts);
+        let baselines = match self.db.get_public_baselines() {
+            Ok(b) => b,
+            Err(e) => return format!("❌ Error retrieving baselines: {}", e),
+        };
+
+        let rows = public_board::build_rows(&candidates, &baselines, opts);
         if rows.is_empty() {
             return "📊 No pre-deadline kaggle submissions yet -- nothing to show.".to_string();
         }
 
-        let svg = public_board::render_svg(&rows, opts);
+        let header = public_board::BoardHeader {
+            title: self.config.competition.name.clone(),
+            generated_at: public_board::generated_at_label(
+                Utc::now(),
+                self.config.competition.timezone_offset_minutes,
+            ),
+        };
+        let svg = public_board::render_svg(&rows, opts, &header);
         let png = match public_board::rasterize_png(&svg) {
             Ok(bytes) => bytes,
             Err(e) => return format!("❌ Error rendering the leaderboard image: {:#}", e),
@@ -501,9 +550,8 @@ impl Bot {
         let filename = format!("public_leaderboard_{}.png", Utc::now().format("%Y%m%d_%H%M%S"));
         match self.client.upload_file(&filename, png, "image/png").await {
             Ok(url) => format!(
-                "📊 **Public leaderboard** ({} competitor{})\n\n[{}]({})",
-                rows.len(),
-                if rows.len() == 1 { "" } else { "s" },
+                "📊 **Public leaderboard** ({})\n\n[{}]({})",
+                row_counts(&rows),
                 filename,
                 url
             ),
@@ -547,9 +595,20 @@ impl Bot {
                 CompetitionMode::Kaggle => {
                     "• `public leaderboard [top=N] [order=best|mean] [values=on|off] [range=MIN:MAX] \
                      [axis=on|off] [median=on|off]` - Generate a PUBLIC gain leaderboard image, safe to share \
-                     with students (never shows a private gain)\n"
+                     with students (never shows a private gain)\n\
+                     • `baseline <name>` (attach one or more CSVs) - Upload a reference model. Never ranked or \
+                     graded; hidden from the public image until published\n\
+                     • `baseline list` - Every baseline, with its ID and whether it's published\n\
+                     • `baseline publish <id>` / `baseline hide <id>` - Show or hide a baseline on the public image\n"
                 }
                 CompetitionMode::Blind => "",
+            };
+            let teacher_submit_note = match mode {
+                CompetitionMode::Kaggle => {
+                    "- Teachers cannot `submit`; use `baseline` for reference models, which appear marked and \
+                     unnumbered in `leaderboard` and, once published, in `public leaderboard`."
+                }
+                CompetitionMode::Blind => "- Teachers cannot submit models.",
             };
             format!(
                 "🤖 **Help for Teachers**\n\n\
@@ -568,7 +627,7 @@ impl Bot {
                 • `grades` - Generate and upload the grades CSV (10 at the max, 8 at the median, linear in between)\n\
                 • `help` - Show this help\n\n\
                 **Notes:**\n\
-                - Teachers cannot submit models.\n\
+                {}\n\
                 {}\n\
                 - Anyone with no valid submission before the deadline gets a grade of 0.",
                 comp.name,
@@ -576,6 +635,7 @@ impl Bot {
                 comp.deadline,
                 self.roster.borrow().len(),
                 public_leaderboard_bullet,
+                teacher_submit_note,
                 mode_notes
             )
         } else {
@@ -614,5 +674,17 @@ impl Bot {
                 ),
             }
         }
+    }
+}
+
+/// "3 competitors" or "3 competitors, 1 baseline" for the public board reply.
+fn row_counts(rows: &[public_board::BoardRow]) -> String {
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    let baselines = rows.iter().filter(|r| r.is_baseline).count();
+    let competitors = rows.len() - baselines;
+    if baselines == 0 {
+        plural(competitors, "competitor")
+    } else {
+        format!("{}, {}", plural(competitors, "competitor"), plural(baselines, "baseline"))
     }
 }

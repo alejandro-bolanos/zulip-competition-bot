@@ -50,3 +50,23 @@ separate bot instances, each against its own throwaway config/database/roster
 (one `blind`, one `kaggle`, the latter needing a `split` column on its
 `master_data.csv`), and invoke this script once per instance with a
 `--config` pointing at the matching `integration_config.json`.
+
+### `exports_test.py`
+
+Kaggle mode only. Covers the teacher exports `integration_test.py` doesn't:
+the `public leaderboard` image, the `all submits` and `grades` CSV
+attachments (it downloads each file and checks its contents), and the public
+board's roster filtering. Uses the same `integration_config.json`.
+
+```bash
+uv run exports_test.py --config integration_config.json
+```
+
+Unlike `integration_test.py`, it never waits for the deadline, so the bot's
+deadline can be far in the future — it only has to not have passed. Each run
+makes 2 submits per student (with unique names, so it works against a
+database that already has data), so each student needs 2 units of daily quota
+left. To test roster filtering it **temporarily edits the bot's
+`roster.csv`** (removes student A, runs `roster reload`), then restores the
+file and reloads again, even if a check fails — so, as with the other script,
+point it only at a throwaway config.

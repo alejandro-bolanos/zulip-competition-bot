@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::config::BotConfig;
-use crate::database::Database;
+use crate::database::{BaselineSummary, Database};
 use crate::master_data::MasterData;
 use crate::models::{GainResult, Message, Submission};
 use crate::roster::{Competitor, Roster};
@@ -89,7 +89,7 @@ pub async fn process_submit(
 
     // Parse command
     let command_word = if use_golden_bullet { "reveal" } else { "submit" };
-    let parts: Vec<&str> = message.content.trim().split_whitespace().collect();
+    let parts: Vec<&str> = message.content.split_whitespace().collect();
     if parts.len() < 3 {
         return format!(
             "❌ Incorrect format. Usage: `{} <submission_name> <expected_gain>` and attach the CSV file",
@@ -194,6 +194,8 @@ pub async fn process_submit(
         batch_id: None,
         public_gain: None,
         private_gain: None,
+        is_baseline: false,
+        baseline_published: false,
     };
 
     // Save to database
@@ -326,119 +328,33 @@ pub async fn process_kaggle_submit(
     // No `<expected_gain>` here, unlike blind mode's `submit`: the public
     // gain is already shown in this very reply, so asking the student to
     // also guess it ahead of time added nothing.
-    let parts: Vec<&str> = message.content.trim().split_whitespace().collect();
+    let parts: Vec<&str> = message.content.split_whitespace().collect();
     if parts.len() < 2 {
         return "❌ Incorrect format. Usage: `submit <submission_name>` and attach one or more CSV files".to_string();
     }
-    let submission_name = parts[1].to_string();
+    let submission_name = parts[1];
 
-    let links = match find_csv_links(&message.content) {
-        Ok(l) => l,
-        Err(e) => return format!("❌ Error parsing the message: {}", e),
+    let (batch_id, rows) = match build_kaggle_batch(
+        message,
+        config,
+        master_data,
+        submission_name,
+        competitor.max_files_per_submission,
+        "submit <name>",
+        after_deadline,
+        false,
+    )
+    .await
+    {
+        Ok(batch) => batch,
+        Err(reply) => return reply,
     };
-    if links.is_empty() {
-        return "❌ You must attach at least one CSV file. Use the format: `submit <name>` and attach the CSVs.".to_string();
-    }
-    if links.len() as u32 > competitor.max_files_per_submission {
-        return format!(
-            "🚫 Too many files in this submission ({} attachments, max {} per submission).",
-            links.len(),
-            competitor.max_files_per_submission
-        );
+
+    if let Err(e) = db.save_batch(&rows) {
+        return format!("❌ Error saving submission: {}", e);
     }
 
-    let mut candidates: Vec<(String, Vec<u8>, HashSet<i32>)> = Vec::with_capacity(links.len());
-    for (filename, url) in links {
-        if !filename.to_lowercase().ends_with(".csv") {
-            return format!("❌ The file '{}' must be a CSV", filename);
-        }
-        let content = match download_attachment(&url, config).await {
-            Ok(c) => c,
-            Err(e) => return format!("❌ Error downloading '{}': {}", filename, e),
-        };
-        let predicted_ids = match read_csv_ids(&content) {
-            Ok(ids) => ids,
-            Err(e) => return format!("❌ Error reading '{}': {}", filename, e),
-        };
-        let invalid_ids = master_data.validate_ids(&predicted_ids);
-        if !invalid_ids.is_empty() {
-            warn!("Invalid IDs in kaggle submission from {}", user_email);
-            return format!(
-                "❌ Invalid IDs in '{}': {} IDs do not exist in the dataset",
-                filename,
-                invalid_ids.len()
-            );
-        }
-        candidates.push((filename, content, predicted_ids));
-    }
-
-    let now = Utc::now();
-    let batch_id = format!("{}-{}", message.sender_id, now.timestamp_micros());
-    let timestamp = now.to_rfc3339();
-
-    let mut public_gains = Vec::with_capacity(candidates.len());
-    let mut rows = Vec::with_capacity(candidates.len());
-
-    for (index, (filename, content, predicted_ids)) in candidates.into_iter().enumerate() {
-        let public_result = calculate_gain_over(
-            &predicted_ids,
-            master_data.public_ids(),
-            master_data.positive_ids(),
-            &config.gain_matrix,
-        );
-        let private_result = calculate_gain_over(
-            &predicted_ids,
-            master_data.private_ids(),
-            master_data.positive_ids(),
-            &config.gain_matrix,
-        );
-
-        let checksum = calculate_checksum(&content);
-        let file_path = match save_submission_file(
-            &message.sender_full_name,
-            &submission_name,
-            &format!("{}_{}", index, filename),
-            &content,
-            false,
-            config,
-        ) {
-            Ok(p) => p,
-            Err(e) => return format!("❌ Error saving file '{}': {}", filename, e),
-        };
-
-        public_gains.push(public_result.gain);
-
-        rows.push(Submission {
-            id: None,
-            user_id: message.sender_id,
-            user_email: user_email.clone(),
-            user_full_name: message.sender_full_name.clone(),
-            submission_name: submission_name.clone(),
-            timestamp: timestamp.clone(),
-            file_checksum: checksum,
-            file_path,
-            expected_gain: None,
-            actual_gain: private_result.gain,
-            tp: private_result.tp,
-            tn: private_result.tn,
-            fp: private_result.fp,
-            fn_: private_result.fn_,
-            positives_predicted: predicted_ids.len() as i32,
-            threshold_category: "kaggle".to_string(),
-            after_deadline,
-            used_golden_bullet: false,
-            batch_id: Some(batch_id.clone()),
-            public_gain: Some(public_result.gain),
-            private_gain: Some(private_result.gain),
-        });
-    }
-
-    for row in &rows {
-        if let Err(e) = db.save_submission(row) {
-            return format!("❌ Error saving submission: {}", e);
-        }
-    }
-
+    let public_gains: Vec<f64> = rows.iter().filter_map(|r| r.public_gain).collect();
     let (mean, std_dev) = mean_and_std(&public_gains);
     let n = rows.len();
 
@@ -469,6 +385,275 @@ pub async fn process_kaggle_submit(
     ));
 
     response
+}
+
+/// The kaggle pipeline shared by a student's `submit` and a teacher's
+/// `baseline`: finds every CSV attached to `message`, downloads, validates
+/// and scores each against both splits, and builds one row per candidate
+/// sharing a fresh `batch_id` -- nothing is stored. Every candidate is
+/// validated before any row exists, so one bad CSV rejects the whole batch.
+/// On failure, the `Err` is the reply to send back. `usage` is the command
+/// syntax named in "attach a CSV" errors.
+#[allow(clippy::too_many_arguments)]
+async fn build_kaggle_batch(
+    message: &Message,
+    config: &BotConfig,
+    master_data: &MasterData,
+    submission_name: &str,
+    max_files: u32,
+    usage: &str,
+    after_deadline: bool,
+    is_baseline: bool,
+) -> Result<(String, Vec<Submission>), String> {
+    let links = find_csv_links(&message.content)
+        .map_err(|e| format!("❌ Error parsing the message: {}", e))?;
+    if links.is_empty() {
+        return Err(format!(
+            "❌ You must attach at least one CSV file. Use the format: `{usage}` and attach the CSVs."
+        ));
+    }
+    if links.len() as u32 > max_files {
+        return Err(format!(
+            "🚫 Too many files in this submission ({} attachments, max {} per submission).",
+            links.len(),
+            max_files
+        ));
+    }
+
+    let mut candidates: Vec<(String, Vec<u8>, HashSet<i32>)> = Vec::with_capacity(links.len());
+    for (filename, url) in links {
+        if !filename.to_lowercase().ends_with(".csv") {
+            return Err(format!("❌ The file '{}' must be a CSV", filename));
+        }
+        let content = download_attachment(&url, config)
+            .await
+            .map_err(|e| format!("❌ Error downloading '{}': {}", filename, e))?;
+        let predicted_ids =
+            read_csv_ids(&content).map_err(|e| format!("❌ Error reading '{}': {}", filename, e))?;
+        let invalid_ids = master_data.validate_ids(&predicted_ids);
+        if !invalid_ids.is_empty() {
+            warn!("Invalid IDs in kaggle submission from {}", message.sender_email);
+            return Err(format!(
+                "❌ Invalid IDs in '{}': {} IDs do not exist in the dataset",
+                filename,
+                invalid_ids.len()
+            ));
+        }
+        candidates.push((filename, content, predicted_ids));
+    }
+
+    let now = Utc::now();
+    let batch_id = format!("{}-{}", message.sender_id, now.timestamp_micros());
+    let timestamp = now.to_rfc3339();
+
+    let mut rows = Vec::with_capacity(candidates.len());
+    for (index, (filename, content, predicted_ids)) in candidates.into_iter().enumerate() {
+        let public_result = calculate_gain_over(
+            &predicted_ids,
+            master_data.public_ids(),
+            master_data.positive_ids(),
+            &config.gain_matrix,
+        );
+        let private_result = calculate_gain_over(
+            &predicted_ids,
+            master_data.private_ids(),
+            master_data.positive_ids(),
+            &config.gain_matrix,
+        );
+
+        let checksum = calculate_checksum(&content);
+        let file_path = save_submission_file(
+            &message.sender_full_name,
+            submission_name,
+            &format!("{}_{}", index, filename),
+            &content,
+            is_baseline,
+            config,
+        )
+        .map_err(|e| format!("❌ Error saving file '{}': {}", filename, e))?;
+
+        rows.push(Submission {
+            id: None,
+            user_id: message.sender_id,
+            user_email: message.sender_email.clone(),
+            user_full_name: message.sender_full_name.clone(),
+            submission_name: submission_name.to_string(),
+            timestamp: timestamp.clone(),
+            file_checksum: checksum,
+            file_path,
+            expected_gain: None,
+            actual_gain: private_result.gain,
+            tp: private_result.tp,
+            tn: private_result.tn,
+            fp: private_result.fp,
+            fn_: private_result.fn_,
+            positives_predicted: predicted_ids.len() as i32,
+            threshold_category: "kaggle".to_string(),
+            after_deadline,
+            used_golden_bullet: false,
+            batch_id: Some(batch_id.clone()),
+            public_gain: Some(public_result.gain),
+            private_gain: Some(private_result.gain),
+            is_baseline,
+            baseline_published: false,
+        });
+    }
+
+    Ok((batch_id, rows))
+}
+
+/// Max candidate CSVs in one `baseline` upload. Teachers aren't on the
+/// roster, so there's no per-person `max_files_per_submission` to read; this
+/// only guards against an accidental huge upload.
+const MAX_BASELINE_FILES: u32 = 20;
+
+/// A teacher's `baseline ...` command, parsed. Pure, so it's unit-testable.
+#[derive(Debug, PartialEq)]
+pub enum BaselineCommand<'a> {
+    Upload(&'a str),
+    Publish(&'a str),
+    Hide(&'a str),
+    List,
+    Usage,
+}
+
+/// Parses everything after the `baseline` word, from the original
+/// (not lowercased) message so the name and id keep their case. Subcommands
+/// match case-insensitively; `list`, `publish` and `hide` therefore can't be
+/// used as a baseline's name. A first word starting with `[` is an
+/// attachment link, meaning the name was left out.
+pub fn parse_baseline_command(args: &str) -> BaselineCommand<'_> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let Some(&first) = parts.first() else {
+        return BaselineCommand::Usage;
+    };
+    match (first.to_lowercase().as_str(), &parts[1..]) {
+        ("list", []) => BaselineCommand::List,
+        ("publish", [id]) => BaselineCommand::Publish(id),
+        ("hide", [id]) => BaselineCommand::Hide(id),
+        ("list" | "publish" | "hide", _) => BaselineCommand::Usage,
+        _ if first.starts_with('[') => BaselineCommand::Usage,
+        _ => BaselineCommand::Upload(first),
+    }
+}
+
+pub fn baseline_usage() -> String {
+    "❌ Usage:\n\
+     • `baseline <name>` and attach one or more CSVs -- upload a reference model (hidden until published)\n\
+     • `baseline list` -- every baseline, with its id and whether it's published\n\
+     • `baseline publish <id>` / `baseline hide <id>` -- show or hide it on the public leaderboard"
+        .to_string()
+}
+
+/// A teacher's `baseline <name>`: the same kaggle pipeline as a student's
+/// `submit`, stored with `is_baseline` set and hidden until published. No
+/// quota and no deadline gate -- a baseline isn't competing -- but it's still
+/// scored on both splits, so a teacher sees exactly where it would land.
+pub async fn process_baseline_upload(
+    message: &Message,
+    config: &BotConfig,
+    db: &Database,
+    master_data: &MasterData,
+    name: &str,
+) -> String {
+    info!("Processing baseline upload from {}", message.sender_email);
+
+    let after_deadline = config
+        .competition
+        .deadline_utc()
+        .map(|deadline| Utc::now() > deadline)
+        .unwrap_or(false);
+
+    let (batch_id, rows) = match build_kaggle_batch(
+        message,
+        config,
+        master_data,
+        name,
+        MAX_BASELINE_FILES,
+        "baseline <name>",
+        after_deadline,
+        true,
+    )
+    .await
+    {
+        Ok(batch) => batch,
+        Err(reply) => return reply,
+    };
+
+    if let Err(e) = db.save_batch(&rows) {
+        return format!("❌ Error saving baseline: {}", e);
+    }
+
+    // Same "best on public, then its private gain" rule as a competitor's batch.
+    let best = rows
+        .iter()
+        .max_by(|a, b| {
+            a.public_gain
+                .partial_cmp(&b.public_gain)
+                .expect("gains are never NaN")
+        })
+        .expect("build_kaggle_batch never returns an empty batch");
+
+    format!(
+        "📐 **Baseline stored:** {name} ({n} candidate{s})\n\
+         📊 Best public gain: {public:.4} -- its private gain: {private:.4}\n\
+         🆔 **Baseline ID**: `{batch_id}`\n\n\
+         🔒 Hidden from the public leaderboard. Publish it with `baseline publish {batch_id}`.\n\
+         Baselines are never ranked or graded.",
+        n = rows.len(),
+        s = if rows.len() == 1 { "" } else { "s" },
+        public = best.public_gain.unwrap_or_default(),
+        private = best.private_gain.unwrap_or_default(),
+    )
+}
+
+pub fn process_baseline_list(db: &Database) -> String {
+    let baselines = match db.get_baselines() {
+        Ok(b) => b,
+        Err(e) => return format!("❌ Error retrieving baselines: {}", e),
+    };
+    if baselines.is_empty() {
+        return "📐 No baselines yet. Upload one with `baseline <name>` and attach the CSVs.".to_string();
+    }
+
+    let mut response = "📐 **Baselines**\n\n".to_string();
+    response.push_str("| Name | 📅 Date | 🔢 Candidates | 📊 Best public | 💰 Its private | Public board | 🆔 ID |\n");
+    response.push_str("|---|---|---|---|---|---|---|\n");
+    for b in &baselines {
+        let ts: String = b.timestamp.chars().take(16).collect();
+        response.push_str(&format!(
+            "| {} | {} | {} | {:.2} | {:.2} | {} | `{}` |\n",
+            b.name,
+            ts,
+            b.candidates,
+            b.best_public_gain,
+            b.private_gain,
+            published_mark(b.published),
+            b.batch_id
+        ));
+    }
+    response
+}
+
+pub fn process_baseline_visibility(db: &Database, batch_id: &str, published: bool) -> String {
+    match db.set_baseline_published(batch_id, published) {
+        Ok(true) if published => format!(
+            "🌐 Baseline `{batch_id}` is now shown on the public leaderboard."
+        ),
+        Ok(true) => format!("🔒 Baseline `{batch_id}` is now hidden from the public leaderboard."),
+        Ok(false) => format!(
+            "❌ No baseline with ID `{batch_id}`. See `baseline list` for the IDs."
+        ),
+        Err(e) => format!("❌ Error updating the baseline: {}", e),
+    }
+}
+
+fn published_mark(published: bool) -> &'static str {
+    if published {
+        "🌐 shown"
+    } else {
+        "🔒 hidden"
+    }
 }
 
 /// Formats an optional gain field for display -- `None` (a competitor with
@@ -657,15 +842,20 @@ pub fn process_leaderboard_full(db: &Database, config: &BotConfig, order_by: &st
         Ok(r) => r,
         Err(e) => return format!("❌ Error retrieving leaderboard: {}", e),
     };
+    let baselines = match config.competition.mode {
+        crate::config::CompetitionMode::Kaggle => match db.get_baselines() {
+            Ok(b) => b,
+            Err(e) => return format!("❌ Error retrieving baselines: {}", e),
+        },
+        crate::config::CompetitionMode::Blind => Vec::new(),
+    };
 
-    if results.is_empty() {
+    if results.is_empty() && baselines.is_empty() {
         return "📊 No submissions on the leaderboard".to_string();
     }
 
-    let order_label = match order_by {
-        "datetime" => "Sorted by date",
-        _ => "Sorted by gain",
-    };
+    let by_date = order_by == "datetime";
+    let order_label = if by_date { "Sorted by date" } else { "Sorted by gain" };
 
     let mut response = format!(
         "🏆 **Full Leaderboard - {} ({})** \n\n",
@@ -675,27 +865,73 @@ pub fn process_leaderboard_full(db: &Database, config: &BotConfig, order_by: &st
     response.push_str("| Pos | Name | TS | 💰 Final | 💰 Expected | 📊 Submissions | 📈 Max |\n");
     response.push_str("|---|---|---|---|---|---|---|\n");
 
-    for (i, (name, email, ts, best_gain, expected_gain, total, max_gain, used_bullet)) in
-        results.iter().enumerate()
-    {
-        if !config.teachers.contains(email) {
-            let ts_str: String = ts.chars().take(16).collect();
-            let bullet_mark = if *used_bullet { " 🌟" } else { "" };
-            response.push_str(&format!(
-                "| {} | {}{} | {} | {:.2} | {} | {} | {} |\n",
-                i + 1,
-                name,
-                bullet_mark,
-                ts_str,
-                best_gain,
-                fmt_gain(*expected_gain),
-                total,
-                fmt_gain(*max_gain)
-            ));
+    // Baselines are interleaved at the position their own score (or date)
+    // would put them, in the same order the SQL sorted the competitors by --
+    // but with no position number, so no competitor's position shifts.
+    let mut baselines: Vec<&BaselineSummary> = baselines.iter().collect();
+    let beats = |b: &BaselineSummary, gain: f64, ts: &str| -> bool {
+        if by_date {
+            parse_timestamp(&b.timestamp) > parse_timestamp(ts)
+        } else {
+            b.private_gain > gain
         }
+    };
+    baselines.sort_by(|a, b| {
+        if by_date {
+            parse_timestamp(&b.timestamp).cmp(&parse_timestamp(&a.timestamp))
+        } else {
+            b.private_gain
+                .partial_cmp(&a.private_gain)
+                .expect("gains are never NaN")
+        }
+    });
+    let mut pending = baselines.into_iter().peekable();
+
+    let mut position = 0;
+    for (name, email, ts, best_gain, expected_gain, total, max_gain, used_bullet) in &results {
+        if config.teachers.contains(email) {
+            continue;
+        }
+        while let Some(b) = pending.next_if(|b| beats(b, *best_gain, ts)) {
+            response.push_str(&baseline_leaderboard_line(b));
+        }
+        position += 1;
+        let ts_str: String = ts.chars().take(16).collect();
+        let bullet_mark = if *used_bullet { " 🌟" } else { "" };
+        response.push_str(&format!(
+            "| {} | {}{} | {} | {:.2} | {} | {} | {} |\n",
+            position,
+            name,
+            bullet_mark,
+            ts_str,
+            best_gain,
+            fmt_gain(*expected_gain),
+            total,
+            fmt_gain(*max_gain)
+        ));
+    }
+    for b in pending {
+        response.push_str(&baseline_leaderboard_line(b));
     }
 
     response
+}
+
+fn baseline_leaderboard_line(b: &BaselineSummary) -> String {
+    let ts: String = b.timestamp.chars().take(16).collect();
+    format!(
+        "| — | 📐 **Baseline: {}** ({}) | {} | {:.2} | N/A | — | — |\n",
+        b.name,
+        published_mark(b.published),
+        ts,
+        b.private_gain
+    )
+}
+
+/// Parses a stored RFC3339 timestamp for ordering. Comparing the strings
+/// directly isn't safe: `to_rfc3339()`'s fractional-second width varies.
+fn parse_timestamp(ts: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(ts).ok().map(|t| t.with_timezone(&Utc))
 }
 
 /// One row of the on-demand grade export. `gain` is the same "last valid
@@ -980,6 +1216,8 @@ fn build_all_submissions_csv(submissions: &[Submission]) -> Result<Vec<u8>> {
         "file_path",
         "after_deadline",
         "used_golden_bullet",
+        "is_baseline",
+        "baseline_published",
     ])?;
 
     for sub in submissions {
@@ -1009,6 +1247,8 @@ fn build_all_submissions_csv(submissions: &[Submission]) -> Result<Vec<u8>> {
             sub.file_path.as_str(),
             if sub.after_deadline { "yes" } else { "no" },
             if sub.used_golden_bullet { "yes" } else { "no" },
+            if sub.is_baseline { "yes" } else { "no" },
+            if sub.baseline_published { "yes" } else { "no" },
         ])?;
     }
 
@@ -1345,6 +1585,8 @@ mod tests {
                 batch_id: None,
                 public_gain: None,
                 private_gain: None,
+                is_baseline: false,
+                baseline_published: false,
             })
             .unwrap();
         }
@@ -1382,6 +1624,8 @@ mod tests {
             batch_id: None,
             public_gain: None,
             private_gain: None,
+            is_baseline: false,
+            baseline_published: false,
         })
         .unwrap();
     }
@@ -1607,6 +1851,8 @@ mod tests {
             batch_id: Some(batch_id.to_string()),
             public_gain: Some(public_gain),
             private_gain: Some(private_gain),
+            is_baseline: false,
+            baseline_published: false,
         })
         .unwrap();
     }
@@ -1655,6 +1901,8 @@ mod tests {
                 batch_id: Some("batch-1".to_string()),
                 public_gain: Some(1.0),
                 private_gain: Some(1.0),
+                is_baseline: false,
+                baseline_published: false,
             })
             .unwrap();
         }
@@ -1744,6 +1992,105 @@ mod tests {
             "a competitor who submitted must be graded on their best-on-public candidate, \
              with no separate `choose` step required"
         );
+    }
+
+    // ---- Baselines -------------------------------------------------------
+
+    fn insert_baseline_candidate(db: &Database, name: &str, batch_id: &str, public_gain: f64, private_gain: f64) {
+        db.save_submission(&Submission {
+            id: None,
+            user_id: 99,
+            user_email: "prof@e.com".to_string(),
+            user_full_name: "Prof".to_string(),
+            submission_name: name.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            file_checksum: format!("b-{}-{}", batch_id, public_gain),
+            file_path: "/tmp/x.csv".to_string(),
+            expected_gain: None,
+            actual_gain: private_gain,
+            tp: 0,
+            tn: 0,
+            fp: 0,
+            fn_: 0,
+            positives_predicted: 0,
+            threshold_category: "kaggle".to_string(),
+            after_deadline: false,
+            used_golden_bullet: false,
+            batch_id: Some(batch_id.to_string()),
+            public_gain: Some(public_gain),
+            private_gain: Some(private_gain),
+            is_baseline: true,
+            baseline_published: false,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn baseline_command_parsing() {
+        use BaselineCommand::*;
+        assert_eq!(parse_baseline_command(" logistic\n\n[a.csv](/u/a.csv)"), Upload("logistic"));
+        assert_eq!(parse_baseline_command(" LogReg-v2 [a.csv](/u)"), Upload("LogReg-v2"), "name keeps its case");
+        assert_eq!(parse_baseline_command(" list"), List);
+        assert_eq!(parse_baseline_command(" LIST"), List, "subcommands are case-insensitive");
+        assert_eq!(parse_baseline_command(" publish 99-123"), Publish("99-123"));
+        assert_eq!(parse_baseline_command(" hide 99-123"), Hide("99-123"));
+        assert_eq!(parse_baseline_command(""), Usage, "no name at all");
+        assert_eq!(parse_baseline_command(" [a.csv](/u/a.csv)"), Usage, "attachment but no name");
+        assert_eq!(parse_baseline_command(" publish"), Usage, "publish needs an id");
+        assert_eq!(parse_baseline_command(" hide a b"), Usage);
+        assert_eq!(parse_baseline_command(" list extra"), Usage);
+    }
+
+    #[test]
+    fn baselines_never_affect_grades_even_if_the_teacher_is_on_the_roster() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.init().unwrap();
+        insert_kaggle_candidate(&db, 1, "a", 5.0, 10.0, false);
+        insert_kaggle_candidate(&db, 2, "b", 5.0, 20.0, false);
+        insert_kaggle_candidate(&db, 3, "c", 5.0, 30.0, false);
+        // A baseline far above everyone: counted, it would become the max and
+        // drag every competitor's grade down.
+        insert_baseline_candidate(&db, "oracle", "t1", 999.0, 9000.0);
+
+        let roster = crate::roster::from_competitors(vec![
+            competitor("u1@e.com", "Ana"),
+            competitor("u2@e.com", "Beto"),
+            competitor("u3@e.com", "Caro"),
+            competitor("prof@e.com", "Prof"),
+        ]);
+        let mut config = test_config("./s", "2026-01-01T23:59:59");
+        config.competition.mode = crate::config::CompetitionMode::Kaggle;
+
+        let rows = compute_grades(&db, &roster, &config).unwrap();
+        let grade_of = |email: &str| rows.iter().find(|r| r.email == email).unwrap().grade;
+        assert_eq!(grade_of("u3@e.com"), 10.0, "the top COMPETITOR still scores 10");
+        assert_eq!(grade_of("u2@e.com"), 8.0, "the competitors' median still scores 8");
+        assert_eq!(grade_of("prof@e.com"), 0.0, "a baseline is never a valid entry");
+    }
+
+    #[test]
+    fn private_leaderboard_interleaves_baselines_without_a_position_number() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.init().unwrap();
+        insert_kaggle_candidate(&db, 1, "a", 5.0, 30.0, false);
+        insert_kaggle_candidate(&db, 2, "b", 5.0, 10.0, false);
+        insert_baseline_candidate(&db, "logistic", "t1", 50.0, 20.0);
+        insert_baseline_candidate(&db, "random", "t2", 1.0, 1.0);
+        db.set_baseline_published("t1", true).unwrap();
+
+        let mut config = test_config("./s", "2026-01-01T23:59:59");
+        config.competition.mode = crate::config::CompetitionMode::Kaggle;
+
+        let table = process_leaderboard_full(&db, &config, "gain");
+        let lines: Vec<&str> = table.lines().filter(|l| l.starts_with("| ") && !l.starts_with("| Pos")).collect();
+        assert_eq!(lines.len(), 4, "{table}");
+        assert!(lines[0].starts_with("| 1 |") && lines[0].contains("30.00"), "{table}");
+        assert!(lines[1].starts_with("| — |") && lines[1].contains("Baseline: logistic"), "{table}");
+        assert!(lines[1].contains("shown") && lines[1].contains("20.00"), "{table}");
+        assert!(lines[2].starts_with("| 2 |") && lines[2].contains("10.00"), "the second competitor is still #2: {table}");
+        assert!(lines[3].contains("Baseline: random") && lines[3].contains("hidden"), "{table}");
     }
 
     // ---- CSV parsing -----------------------------------------------------

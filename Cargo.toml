@@ -67,6 +67,7 @@ tempfile = "3.8"
 resvg = "0.48.1"
 usvg = "0.48.1"
 fontdb = "0.24"
+skrifa = "0.44"
 
 [profile.release]
 opt-level = 3
