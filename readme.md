@@ -199,9 +199,10 @@ Both modes share the same daily submission quota — in kaggle mode, one entry (
 - `user submits @user` — a specific user's submissions (use a real Zulip `@`-mention)
 - `roster reload` — reload the roster from disk without restarting the bot
 - `grades` — generate and upload the grade CSV (see [Grading](#grading))
+- `baseline <name>` (attach one or more CSVs), `baseline list`, `baseline publish <id>`, `baseline hide <id>` — kaggle mode only, see [Baselines](#baselines)
 - `help` — show this help
 
-Teachers cannot submit models themselves.
+Teachers cannot `submit` models as competitors. In kaggle mode they can upload reference models with `baseline` instead, which are never ranked or graded.
 
 ## Competition modes
 
@@ -217,7 +218,7 @@ Teachers generate grades on demand with `grades` — nothing is exported automat
 grade = 8 + 2 × (gain − median) / (max − median)
 ```
 
-floored at 0. Median and max are computed only over competitors with at least one valid pre-deadline entry; a competitor with none gets a flat grade of 0. The maximum gain scores 10, the median scores 8, and everything scales linearly in between (below the median, this can go negative before the floor).
+floored at 0. Median and max are computed only over competitors with at least one valid pre-deadline entry; a competitor with none gets a flat grade of 0. [Baselines](#baselines) never count, published or not. The maximum gain scores 10, the median scores 8, and everything scales linearly in between (below the median, this can go negative before the floor).
 
 The exported CSV mirrors the private leaderboard row for that same competitor, so a grade and its leaderboard row can never disagree:
 
@@ -232,7 +233,7 @@ ana@example.com,Ana Gomez,132.5,120,2025-12-30T18:04:02Z,3,140,no,9.25
 
 Kaggle mode only. Teachers generate a PNG leaderboard image with `public leaderboard`, safe to share directly with students — unlike `leaderboard`, it is built from a query that never returns `private_gain` or an email, only each competitor's Zulip display name and *public* gains. That same query only considers competitors currently on the roster, so removing someone from `roster.csv` also removes them from this image, even if their old submissions are still in the database. The bot uploads the PNG and DMs the teacher the link; the bot cannot post to a stream itself, so sharing it with the class is a manual step.
 
-Each row shows a competitor's rank, display name (with `(n=K)` for their candidate count — shape height is normalized per row, so it alone can't tell a 3-candidate row from a 40-candidate one), and a shape summarizing the *public* gain of every candidate in their best-ever batch: a dot for a single candidate, a line for two, a smoothed triangle for three, and a filled density curve for four or more. No individual candidate ticks and no highlighted marker are ever drawn — the shape is the entire representation.
+Each row shows a competitor's rank, display name (with `(n=K)` for their candidate count — shape height is normalized per row, so it alone can't tell a 3-candidate row from a 40-candidate one), and a shape summarizing the *public* gain of every candidate in their best-ever batch: a dot for a single candidate, a line for two, a smoothed triangle for three, and a filled density curve for four or more, drawn only over that competitor's own candidates rather than across the whole axis. No individual candidate ticks and no highlighted marker are ever drawn — the shape is the entire representation. The image carries its own context: the competition name, the ranking criterion, and when it was generated (in the competition's timezone), so it still makes sense once it's shared on its own.
 
 Options (all optional, `key=value`, any order):
 
@@ -243,7 +244,19 @@ Options (all optional, `key=value`, any order):
 | `values` | `on`, `off` | `on` | Show the numeric best-gain value per row |
 | `range` | `MIN:MAX` | auto | X-axis bounds; candidates outside it are clipped, marked with a `◄`/`►` overflow arrow rather than silently dropped |
 | `axis` | `on`, `off` | `on` | Show the numeric x-axis |
-| `median` | `on`, `off` | `off` | Draw a vertical line at the median of the shown rows' best gains — the same anchor the grade formula uses (median → 8) |
+| `median` | `on`, `off` | `off` | Draw a vertical line at the median best *public* gain of the competitors shown (baselines excluded), so it moves with `top`. A visual reference only — it is **not** the median the grade formula uses, which is computed from *private* gains over every competitor |
+
+Published [baselines](#baselines) appear as extra rows, placed where their own best public gain puts them, on a pale amber band with an amber shape, a `—` instead of a rank number, and the label `Baseline: <name>` — labeled by the baseline's name, never the teacher's. They never take a rank (the competitors around them keep theirs), never count toward `top`, and are shown even if they score below the last competitor shown.
+
+## Baselines
+
+Kaggle mode only. A baseline is a teacher's reference model — a simple benchmark such as "logistic regression" or "predict all positive" — for students to measure themselves against.
+
+- `baseline <name>` with one or more CSVs attached uploads one. It goes through the same scoring as a student's `submit` (both splits, best-on-public candidate), but with no daily quota, no deadline gate, and up to 20 files. The reply shows its best public gain, that candidate's private gain, and its ID.
+- It starts **hidden** from the public leaderboard image. `baseline publish <id>` shows it and `baseline hide <id>` hides it again, one baseline at a time.
+- `baseline list` shows every baseline with its ID, candidate count, best public gain, that candidate's private gain, and whether it's shown.
+
+A baseline is never a competitor: it's never ranked, never graded, never counted as the median or max, and never listed by `no submits`. Teachers always see every baseline in `leaderboard`, published or not: each is interleaved where its private gain puts it, with `—` instead of a position number, marked `📐 Baseline` plus 🌐 shown or 🔒 hidden. In the `all submits` CSV, `is_baseline` and `baseline_published` identify baseline rows. `list`, `publish` and `hide` are subcommands, so they can't be used as a baseline name.
 
 ## Golden bullets
 

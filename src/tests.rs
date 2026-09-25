@@ -1,5 +1,5 @@
-/// Tests that exercise the real code paths (as opposed to the module below,
-/// which reimplements logic inline and passes regardless of the implementation).
+/// Cross-module tests that exercise the real code paths (config validation,
+/// the leaderboard SQL, per-user isolation, batch atomicity).
 #[cfg(test)]
 mod behaviour {
     use crate::config::{parse_config_datetime, BotConfig, CompetitionMode};
@@ -246,6 +246,8 @@ mod behaviour {
             batch_id: None,
             public_gain: None,
             private_gain: None,
+            is_baseline: false,
+            baseline_published: false,
         }
     }
 
@@ -355,6 +357,38 @@ mod behaviour {
     }
 
     #[test]
+    fn save_batch_stores_all_candidates_or_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        db.init().unwrap();
+
+        // Make any insert of a row named "boom" fail, so the batch below
+        // dies on its SECOND row -- after the first one already went in.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_on_boom BEFORE INSERT ON submissions
+                 WHEN NEW.submission_name = 'boom'
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+
+        let ok = kaggle_submission(1, "Ana", "2025-01-01T10:00:00Z", "b1", 5.0, 20.0, false);
+        let mut bad = ok.clone();
+        bad.submission_name = "boom".to_string();
+
+        assert!(db.save_batch(&[ok.clone(), bad]).is_err());
+        assert!(
+            db.get_user_submissions(1).unwrap().is_empty(),
+            "a failed batch must leave nothing behind, not its first row"
+        );
+
+        db.save_batch(&[ok.clone(), ok]).unwrap();
+        assert_eq!(db.get_user_submissions(1).unwrap().len(), 2);
+    }
+
+    #[test]
     fn kaggle_leaderboard_includes_every_user_who_submitted() {
         let (_dir, db) = db_with(&[kaggle_submission(
             1,
@@ -409,6 +443,102 @@ mod behaviour {
         s.public_gain = Some(public_gain);
         s.private_gain = Some(private_gain);
         s
+    }
+
+    /// A teacher's baseline candidate: user 99, `t@e.com`, named `name`.
+    fn baseline_candidate(name: &str, batch_id: &str, public_gain: f64, private_gain: f64) -> Submission {
+        let mut s = kaggle_submission(99, "Teacher", "2025-01-05T10:00:00Z", batch_id, public_gain, private_gain, false);
+        s.user_email = "t@e.com".to_string();
+        s.submission_name = name.to_string();
+        s.is_baseline = true;
+        s
+    }
+
+    #[test]
+    fn baselines_never_enter_the_private_leaderboard_rows() {
+        let (_dir, db) = db_with(&[
+            kaggle_submission(1, "Ana", "2025-01-01T10:00:00Z", "a1", 5.0, 20.0, false),
+            // Beats Ana on both splits -- must still never become a row.
+            baseline_candidate("logistic", "t1", 900.0, 900.0),
+        ]);
+        for mode in [CompetitionMode::Kaggle, CompetitionMode::Blind] {
+            let rows = db.get_leaderboard("gain", mode).unwrap();
+            assert_eq!(rows.len(), 1, "{mode:?}: only the competitor is a leaderboard row");
+            assert_eq!(rows[0].0, "Ana");
+        }
+    }
+
+    #[test]
+    fn baselines_never_reach_the_public_candidates_even_if_the_teacher_is_on_the_roster() {
+        let (_dir, db) = db_with(&[
+            kaggle_submission(1, "Ana", "2025-01-01T10:00:00Z", "a1", 5.0, 20.0, false),
+            baseline_candidate("logistic", "t1", 50.0, 50.0),
+        ]);
+        let teacher = crate::roster::Competitor {
+            email: "t@e.com".to_string(),
+            full_name: "Teacher".to_string(),
+            daily_submit_limit: 5,
+            golden_bullets: 0,
+            max_files_per_submission: 5,
+        };
+        let mut ana = teacher.clone();
+        ana.email = "u1@e.com".to_string();
+        let roster = crate::roster::from_competitors(vec![teacher, ana]);
+
+        let candidates = db.get_public_candidates(&roster).unwrap();
+        assert_eq!(candidates.len(), 1, "the baseline must not appear as a competitor candidate");
+        assert_eq!(candidates[0].0, 1);
+    }
+
+    #[test]
+    fn a_baseline_is_hidden_until_published_and_hides_again() {
+        let (_dir, db) = db_with(&[
+            baseline_candidate("logistic", "t1", 50.0, 40.0),
+            baseline_candidate("logistic", "t1", 30.0, 60.0),
+        ]);
+        assert!(db.get_public_baselines().unwrap().is_empty(), "hidden by default");
+
+        assert!(db.set_baseline_published("t1", true).unwrap());
+        let public = db.get_public_baselines().unwrap();
+        assert_eq!(public.len(), 2, "every candidate of the batch, for its shape");
+        assert!(public.iter().all(|(name, batch, _)| name == "logistic" && batch == "t1"));
+
+        assert!(db.set_baseline_published("t1", false).unwrap());
+        assert!(db.get_public_baselines().unwrap().is_empty());
+    }
+
+    #[test]
+    fn publishing_by_a_students_batch_id_changes_nothing() {
+        let (_dir, db) = db_with(&[kaggle_submission(1, "Ana", "2025-01-01T10:00:00Z", "a1", 5.0, 20.0, false)]);
+        assert!(!db.set_baseline_published("a1", true).unwrap(), "a1 is not a baseline");
+        assert!(!db.set_baseline_published("nope", true).unwrap());
+        assert!(!db.get_user_submissions(1).unwrap()[0].baseline_published);
+        assert!(db.get_public_baselines().unwrap().is_empty());
+    }
+
+    #[test]
+    fn baseline_summary_scores_the_best_public_candidate() {
+        let (_dir, db) = db_with(&[
+            baseline_candidate("logistic", "t1", 50.0, 40.0),
+            // Best on public -- its PRIVATE gain is the one reported.
+            baseline_candidate("logistic", "t1", 70.0, 10.0),
+            baseline_candidate("logistic", "t1", 30.0, 90.0),
+            kaggle_submission(1, "Ana", "2025-01-01T10:00:00Z", "a1", 5.0, 20.0, false),
+        ]);
+        let baselines = db.get_baselines().unwrap();
+        assert_eq!(baselines.len(), 1, "one entry per upload, and no competitor rows");
+        let b = &baselines[0];
+        assert_eq!((b.name.as_str(), b.batch_id.as_str()), ("logistic", "t1"));
+        assert_eq!(b.candidates, 3);
+        assert_eq!(b.best_public_gain, 70.0);
+        assert_eq!(b.private_gain, 10.0, "the best-on-public candidate's private gain, not the best private");
+        assert!(!b.published);
+    }
+
+    #[test]
+    fn no_submits_ignores_a_teachers_baselines() {
+        let (_dir, db) = db_with(&[baseline_candidate("logistic", "t1", 50.0, 40.0)]);
+        assert!(db.get_distinct_submitter_emails().unwrap().is_empty());
     }
 
     #[test]
@@ -587,6 +717,15 @@ mod behaviour {
                 [],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO submissions (user_id, user_email, user_full_name, submission_name,
+                     timestamp, file_checksum, file_path, expected_gain, actual_gain,
+                     tp, tn, fp, fn, positives_predicted, threshold_category, after_deadline)
+                 VALUES (2, 'old@e.com', 'Old', 'old', '2024-01-01T00:00:00Z', 'c', '/x',
+                     1.0, 5.0, 0, 0, 0, 0, 0, 'a', 0)",
+                [],
+            )
+            .unwrap();
         }
 
         let db = Database::new(path.to_str().unwrap()).unwrap();
@@ -595,6 +734,11 @@ mod behaviour {
         db.save_submission(&submission(1, "Ana", "2025-01-01T10:00:00Z", 10.0, false))
             .unwrap();
         assert_eq!(db.get_golden_bullets_used(1).unwrap(), 0);
+
+        // A row that predates the baseline columns must read back as an
+        // ordinary, unpublished competitor row.
+        let old = &db.get_user_submissions(2).unwrap()[0];
+        assert!(!old.is_baseline && !old.baseline_published);
     }
 
     #[test]
@@ -619,155 +763,5 @@ mod behaviour {
             .map(|r| r.0)
             .collect();
         assert_eq!(by_date, vec!["Ana", "Beto"]);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_config_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        // This would need to be adapted to use the actual config module
-        assert!(temp_dir.path().exists());
-    }
-
-    #[test]
-    fn test_checksum_calculation() {
-        use hex;
-        use sha2::{Digest, Sha256};
-
-        let data = b"test data";
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let result = hex::encode(hasher.finalize());
-
-        assert_eq!(result.len(), 64); // SHA-256 produces 64 hex characters
-    }
-
-    #[test]
-    fn test_csv_id_parsing() {
-        let csv_data = "123\n456\n789\n";
-        let expected_ids: HashSet<i32> = vec![123, 456, 789].into_iter().collect();
-
-        // This tests the concept of parsing CSV IDs
-        let mut ids = HashSet::new();
-        for line in csv_data.lines() {
-            if let Ok(id) = line.trim().parse::<i32>() {
-                ids.insert(id);
-            }
-        }
-
-        assert_eq!(ids, expected_ids);
-    }
-
-    #[test]
-    fn test_gain_calculation() {
-        // Test confusion matrix calculation
-        let tp = 100;
-        let tn = 800;
-        let fp = 50;
-        let fn_val = 50;
-
-        let gain_tp = 1.0;
-        let gain_tn = 0.5;
-        let gain_fp = -0.1;
-        let gain_fn = -0.5;
-
-        let gain = (tp as f64) * gain_tp
-            + (tn as f64) * gain_tn
-            + (fp as f64) * gain_fp
-            + (fn_val as f64) * gain_fn;
-
-        assert_eq!(gain, 100.0 + 400.0 - 5.0 - 25.0);
-        assert_eq!(gain, 470.0);
-    }
-
-    #[test]
-    fn test_threshold_category() {
-        let thresholds = vec![(100.0, "excellent"), (50.0, "good"), (0.0, "basic")];
-
-        let gain = 75.0;
-        let mut category = thresholds.last().unwrap().1;
-
-        for (min_gain, cat) in thresholds.iter() {
-            if gain >= *min_gain {
-                category = cat;
-                break;
-            }
-        }
-
-        assert_eq!(category, "good");
-    }
-
-    #[test]
-    fn test_master_data_validation() {
-        let all_ids: HashSet<i32> = vec![1, 2, 3, 4, 5].into_iter().collect();
-        let predicted_ids: HashSet<i32> = vec![1, 2, 6, 7].into_iter().collect();
-
-        let mut invalid_ids: Vec<i32> = predicted_ids
-            .iter()
-            .filter(|id| !all_ids.contains(id))
-            .copied()
-            .collect();
-        invalid_ids.sort();
-        assert_eq!(invalid_ids, vec![6, 7]);
-    }
-
-    #[test]
-    fn test_confusion_matrix() {
-        let true_positives: HashSet<i32> = vec![1, 2, 3].into_iter().collect();
-        let all_ids: HashSet<i32> = vec![1, 2, 3, 4, 5].into_iter().collect();
-        let predicted_positives: HashSet<i32> = vec![1, 2, 4].into_iter().collect();
-
-        let mut tp = 0;
-        let mut tn = 0;
-        let mut fp = 0;
-        let mut fn_val = 0;
-
-        for id in &all_ids {
-            let is_positive = true_positives.contains(id);
-            let predicted_positive = predicted_positives.contains(id);
-
-            match (is_positive, predicted_positive) {
-                (true, true) => tp += 1,
-                (true, false) => fn_val += 1,
-                (false, true) => fp += 1,
-                (false, false) => tn += 1,
-            }
-        }
-
-        assert_eq!(tp, 2); // 1, 2
-        assert_eq!(fn_val, 1); // 3
-        assert_eq!(fp, 1); // 4
-        assert_eq!(tn, 1); // 5
-    }
-
-    #[test]
-    fn test_safe_filename() {
-        let submission_name = "My Model #1 (test)";
-        let safe_name: String = submission_name
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-            .collect();
-
-        assert_eq!(safe_name, "My Model 1 test");
-    }
-
-    #[test]
-    fn test_deadline_comparison() {
-        use chrono::{DateTime, Utc};
-
-        let deadline = DateTime::parse_from_rfc3339("2025-12-31T23:59:59Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        let test_time = DateTime::parse_from_rfc3339("2025-12-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        assert!(test_time < deadline);
     }
 }
