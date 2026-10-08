@@ -1115,17 +1115,125 @@ pub async fn export_grades_csv(rows: &[GradeRow], client: &ZulipClient) -> Strin
 
 /// The name inside the first Zulip mention in `content` -- `@**Name**`, or
 /// `@**Name|123**`, the form Zulip uses to disambiguate two users with the
-/// same name (the `|123` user id is dropped). Accepts anything but `*` in
-/// the name, so hyphens, periods and apostrophes ("Diego R.", "O'Brien")
-/// work. Silent mentions (`@_**Name**`) are accepted too.
-pub fn mentioned_user_name(content: &str) -> Option<String> {
+/// same name (the `|123` user id is dropped) -- plus everything after the
+/// mention. Accepts anything but `*` in the name, so hyphens, periods and
+/// apostrophes ("Diego R.", "O'Brien") work. Silent mentions (`@_**Name**`)
+/// are accepted too.
+pub fn split_mention(content: &str) -> Option<(String, &str)> {
     let re = Regex::new(r"@_?\*\*([^*]+)\*\*").expect("static regex");
-    let inner = re.captures(content)?.get(1)?.as_str();
+    let caps = re.captures(content)?;
+    let inner = caps.get(1)?.as_str();
     let name = inner.split('|').next().unwrap_or(inner).trim();
-    (!name.is_empty()).then(|| name.to_string())
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), &content[caps.get(0)?.end()..]))
 }
 
-pub fn process_user_submits(user_identifier: &str, db: &Database, config: &BotConfig) -> String {
+/// What `user submits` sorts by. In kaggle mode: `Gain` is the private gain
+/// of the batch's best-on-public candidate (the graded value), `Mean` the
+/// batch's public mean, `Max` its best public gain. In blind mode a
+/// submission has a single gain, so all three sort by `actual_gain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitSortKey {
+    Gain,
+    Mean,
+    Max,
+    Date,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitOrder {
+    pub key: SubmitSortKey,
+    pub descending: bool,
+}
+
+impl Default for SubmitOrder {
+    /// Newest first -- what `user submits` always showed before it was sortable.
+    fn default() -> Self {
+        Self {
+            key: SubmitSortKey::Date,
+            descending: true,
+        }
+    }
+}
+
+impl SubmitOrder {
+    fn label(self) -> String {
+        let (key, high_first, low_first) = match self.key {
+            SubmitSortKey::Gain => ("gain", "highest first", "lowest first"),
+            SubmitSortKey::Mean => ("mean", "highest first", "lowest first"),
+            SubmitSortKey::Max => ("max", "highest first", "lowest first"),
+            SubmitSortKey::Date => ("date", "newest first", "oldest first"),
+        };
+        format!("{key}, {}", if self.descending { high_first } else { low_first })
+    }
+}
+
+pub fn user_submits_usage(problem: &str) -> String {
+    format!(
+        "❌ {problem}\n\nUsage: `user submits @user [gain|mean|max|date] [asc|desc]` \
+         (use a real Zulip mention; default: `date desc`)"
+    )
+}
+
+/// Parses the optional sort words after the mention, in either order and
+/// case-insensitively. A missing key means `date`; a missing direction
+/// means `desc`.
+pub fn parse_submit_order(args: &str) -> Result<SubmitOrder, String> {
+    let mut key = None;
+    let mut descending = None;
+    for word in args.split_whitespace() {
+        let parsed_key = match word.to_lowercase().as_str() {
+            "gain" => Some(SubmitSortKey::Gain),
+            "mean" => Some(SubmitSortKey::Mean),
+            "max" => Some(SubmitSortKey::Max),
+            "date" => Some(SubmitSortKey::Date),
+            "asc" | "desc" if descending.is_none() => {
+                descending = Some(word.eq_ignore_ascii_case("desc"));
+                continue;
+            }
+            _ => None,
+        };
+        match parsed_key {
+            Some(k) if key.is_none() => key = Some(k),
+            _ => return Err(user_submits_usage(&format!("Unexpected `{word}`."))),
+        }
+    }
+    let default = SubmitOrder::default();
+    Ok(SubmitOrder {
+        key: key.unwrap_or(default.key),
+        descending: descending.unwrap_or(default.descending),
+    })
+}
+
+/// Sorts by `order`: dates are parsed rather than compared as strings
+/// (`to_rfc3339()`'s fractional-second width varies), and ties always fall
+/// back to newest first.
+fn sort_for_user_submits<T>(
+    items: &mut [T],
+    order: SubmitOrder,
+    gain: impl Fn(&T, SubmitSortKey) -> f64,
+    timestamp: impl Fn(&T) -> &str,
+) {
+    items.sort_by(|a, b| {
+        let primary = match order.key {
+            SubmitSortKey::Date => parse_timestamp(timestamp(a)).cmp(&parse_timestamp(timestamp(b))),
+            key => gain(a, key)
+                .partial_cmp(&gain(b, key))
+                .expect("gains are never NaN"),
+        };
+        let primary = if order.descending { primary.reverse() } else { primary };
+        primary.then_with(|| parse_timestamp(timestamp(b)).cmp(&parse_timestamp(timestamp(a))))
+    });
+}
+
+pub fn process_user_submits(
+    user_identifier: &str,
+    order: SubmitOrder,
+    db: &Database,
+    config: &BotConfig,
+) -> String {
     let submissions = match db.get_user_submissions_by_identifier(user_identifier) {
         Ok(s) => s,
         Err(e) => return format!("❌ Error retrieving submissions: {}", e),
@@ -1136,10 +1244,17 @@ pub fn process_user_submits(user_identifier: &str, db: &Database, config: &BotCo
     }
 
     if config.competition.mode == crate::config::CompetitionMode::Kaggle {
-        return user_submits_kaggle(user_identifier, &submissions);
+        return user_submits_kaggle(user_identifier, &submissions, order);
     }
 
-    let mut response = format!("📋 **Submissions for '{}':**\n\n", user_identifier);
+    let mut submissions = submissions;
+    sort_for_user_submits(&mut submissions, order, |s, _| s.actual_gain, |s| &s.timestamp);
+
+    let mut response = format!(
+        "📋 **Submissions for '{}'** (sorted by {}):\n\n",
+        user_identifier,
+        order.label()
+    );
     response.push_str("| ID | Name | 📅 Date | 💰 Expected | ✨ Actual | 🎯 | ⏰ |\n");
     response.push_str("|---|---|---|---|---|---|---|\n");
 
@@ -1166,24 +1281,54 @@ pub fn process_user_submits(user_identifier: &str, db: &Database, config: &BotCo
 /// the private side too: the batch's best candidate on PUBLIC and that
 /// candidate's PRIVATE gain -- the exact value the leaderboard and grades
 /// use if this turns out to be the student's last pre-deadline batch.
-fn user_submits_kaggle(user_identifier: &str, submissions: &[Submission]) -> String {
-    let mut response = format!("📋 **Submissions for '{}':**\n\n", user_identifier);
+fn user_submits_kaggle(user_identifier: &str, submissions: &[Submission], order: SubmitOrder) -> String {
+    struct BatchRow<'a> {
+        key: String,
+        candidates: usize,
+        best: &'a Submission,
+        mean: f64,
+        std_dev: f64,
+    }
+
+    let mut batches: Vec<BatchRow> = group_by_batch(submissions)
+        .into_iter()
+        .map(|(key, rows)| {
+            let best = *rows
+                .iter()
+                .max_by(|a, b| {
+                    a.public_gain
+                        .partial_cmp(&b.public_gain)
+                        .expect("gains are never NaN")
+                })
+                .expect("a batch is never empty");
+            let gains: Vec<f64> = rows.iter().filter_map(|s| s.public_gain).collect();
+            let (mean, std_dev) = mean_and_std(&gains);
+            BatchRow { key, candidates: rows.len(), best, mean, std_dev }
+        })
+        .collect();
+
+    sort_for_user_submits(
+        &mut batches,
+        order,
+        |b, key| match key {
+            SubmitSortKey::Gain => b.best.private_gain.unwrap_or(f64::NEG_INFINITY),
+            SubmitSortKey::Max => b.best.public_gain.unwrap_or(f64::NEG_INFINITY),
+            SubmitSortKey::Mean | SubmitSortKey::Date => b.mean,
+        },
+        |b| &b.best.timestamp,
+    );
+
+    let mut response = format!(
+        "📋 **Submissions for '{}'** (sorted by {}):\n\n",
+        user_identifier,
+        order.label()
+    );
     response.push_str(
         "| Name | 📅 Date | 🔢 Candidates | 🏆 Best public | 💰 Its private | 📊 Public mean ± std | 🆔 Batch | ⏰ |\n",
     );
     response.push_str("|---|---|---|---|---|---|---|---|\n");
 
-    for (key, rows) in &group_by_batch(submissions) {
-        let best = rows
-            .iter()
-            .max_by(|a, b| {
-                a.public_gain
-                    .partial_cmp(&b.public_gain)
-                    .expect("gains are never NaN")
-            })
-            .expect("a batch is never empty");
-        let gains: Vec<f64> = rows.iter().filter_map(|s| s.public_gain).collect();
-        let (mean, std_dev) = mean_and_std(&gains);
+    for BatchRow { key, candidates, best, mean, std_dev } in &batches {
         let name = if best.is_baseline {
             format!("📐 {}", best.submission_name)
         } else {
@@ -1195,7 +1340,7 @@ fn user_submits_kaggle(user_identifier: &str, submissions: &[Submission]) -> Str
             "|{}|{}|{}|{}|{}|{:.2} ± {:.2}|`{}`|{}|\n",
             name,
             ts,
-            rows.len(),
+            candidates,
             fmt_gain(best.public_gain),
             fmt_gain(best.private_gain),
             mean,
@@ -2023,7 +2168,7 @@ mod tests {
         let mut config = test_config("./s", "2026-01-01T23:59:59");
         config.competition.mode = crate::config::CompetitionMode::Kaggle;
 
-        let table = process_user_submits("u1@e.com", &db, &config);
+        let table = process_user_submits("u1@e.com", SubmitOrder::default(), &db, &config);
         let rows: Vec<&str> = table.lines().filter(|l| l.contains("`b")).collect();
         assert_eq!(rows.len(), 2, "one row per batch, not per candidate: {table}");
 
@@ -2040,7 +2185,7 @@ mod tests {
 
     #[test]
     fn mentions_with_any_name_characters_are_parsed() {
-        let m = |s: &str| mentioned_user_name(s);
+        let m = |s: &str| split_mention(s).map(|(name, _)| name);
         assert_eq!(m("user submits @**Ana Gómez**").as_deref(), Some("Ana Gómez"));
         assert_eq!(m("user submits @**test-student-1-bot**").as_deref(), Some("test-student-1-bot"));
         assert_eq!(m("user submits @**Diego R.**").as_deref(), Some("Diego R."));
@@ -2049,6 +2194,97 @@ mod tests {
         assert_eq!(m("user submits @_**Ana**").as_deref(), Some("Ana"), "silent mention");
         assert_eq!(m("user submits Ana"), None);
         assert_eq!(m("user submits @****"), None);
+        assert_eq!(
+            split_mention("user submits @**Ana|42** mean asc").map(|(_, rest)| rest),
+            Some(" mean asc"),
+            "the text after the mention is returned for the sort options"
+        );
+    }
+
+    #[test]
+    fn submit_order_parsing() {
+        use SubmitSortKey::*;
+        let p = |s: &str| parse_submit_order(s);
+        assert_eq!(p("").unwrap(), SubmitOrder::default());
+        assert_eq!(p("").unwrap(), SubmitOrder { key: Date, descending: true }, "newest first by default");
+        assert_eq!(p(" mean").unwrap(), SubmitOrder { key: Mean, descending: true }, "desc by default");
+        assert_eq!(p(" max asc").unwrap(), SubmitOrder { key: Max, descending: false });
+        assert_eq!(p(" ASC Gain").unwrap(), SubmitOrder { key: Gain, descending: false }, "any order, any case");
+        assert_eq!(p(" desc").unwrap(), SubmitOrder { key: Date, descending: true });
+        assert_eq!(p(" date asc").unwrap(), SubmitOrder { key: Date, descending: false });
+        let err = p(" media").unwrap_err();
+        assert!(err.contains("Unexpected `media`") && err.contains("Usage:"), "{err}");
+        assert!(p(" mean max").is_err(), "two keys");
+        assert!(p(" asc desc").is_err(), "two directions");
+    }
+
+    fn batch_order(table: &str) -> Vec<String> {
+        table
+            .lines()
+            .filter_map(|l| l.split('`').nth(1).filter(|_| l.starts_with('|')))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn user_submits_sorts_kaggle_batches_by_each_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.init().unwrap();
+        // Inserted oldest -> newest (timestamps come from Utc::now()).
+        //            best public  its private  public mean
+        // b-old:        9.0          10.0         5.0
+        // b-mid:        6.0          50.0         6.0
+        // b-new:        8.0          30.0         4.0
+        insert_kaggle_candidate(&db, 1, "b-old", 9.0, 10.0, false);
+        insert_kaggle_candidate(&db, 1, "b-old", 1.0, 99.0, false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        insert_kaggle_candidate(&db, 1, "b-mid", 6.0, 50.0, false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        insert_kaggle_candidate(&db, 1, "b-new", 8.0, 30.0, false);
+        insert_kaggle_candidate(&db, 1, "b-new", 0.0, 1.0, false);
+
+        let mut config = test_config("./s", "2026-01-01T23:59:59");
+        config.competition.mode = crate::config::CompetitionMode::Kaggle;
+        let sorted = |args: &str| {
+            let order = parse_submit_order(args).unwrap();
+            batch_order(&process_user_submits("u1@e.com", order, &db, &config))
+        };
+
+        assert_eq!(sorted(""), ["b-new", "b-mid", "b-old"], "default: newest first");
+        assert_eq!(sorted(" date asc"), ["b-old", "b-mid", "b-new"]);
+        assert_eq!(sorted(" gain"), ["b-mid", "b-new", "b-old"], "by the best-on-public candidate's private gain, not 99");
+        assert_eq!(sorted(" gain asc"), ["b-old", "b-new", "b-mid"]);
+        assert_eq!(sorted(" max"), ["b-old", "b-new", "b-mid"]);
+        assert_eq!(sorted(" mean"), ["b-mid", "b-old", "b-new"]);
+        assert_eq!(sorted(" mean asc"), ["b-new", "b-old", "b-mid"]);
+
+        let table = process_user_submits("u1@e.com", parse_submit_order(" mean asc").unwrap(), &db, &config);
+        assert!(table.contains("(sorted by mean, lowest first)"), "{table}");
+    }
+
+    #[test]
+    fn user_submits_sorts_blind_submissions_by_gain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.init().unwrap();
+        insert_valid_submission(&db, 1, "a@e.com", "Ana", 20.0, false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        insert_valid_submission(&db, 2, "a2@e.com", "Ana B", 10.0, false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        insert_valid_submission(&db, 3, "a3@e.com", "Ana C", 30.0, false);
+
+        let config = test_config("./s", "2026-01-01T23:59:59");
+        let gains = |args: &str| -> Vec<String> {
+            process_user_submits("Ana", parse_submit_order(args).unwrap(), &db, &config)
+                .lines()
+                .filter(|l| l.starts_with('|') && !l.starts_with("| ID") && !l.starts_with("|---"))
+                .map(|l| l.split('|').nth(5).unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(gains(""), ["30.00", "10.00", "20.00"], "default: newest first");
+        assert_eq!(gains(" gain"), ["30.00", "20.00", "10.00"]);
+        assert_eq!(gains(" mean asc"), ["10.00", "20.00", "30.00"], "mean/max mean the single gain in blind mode");
     }
 
     #[test]
@@ -2060,7 +2296,7 @@ mod tests {
         insert_valid_submission(&db, 2, "a2@e.com", "Ana B", 20.0, false);
 
         let config = test_config("./s", "2026-01-01T23:59:59");
-        let table = process_user_submits("Ana", &db, &config);
+        let table = process_user_submits("Ana", SubmitOrder::default(), &db, &config);
         assert!(table.contains("✨ Actual"), "blind keeps its own columns: {table}");
         assert_eq!(table.lines().filter(|l| l.starts_with('|') && !l.starts_with("| ID") && !l.starts_with("|---")).count(), 2);
     }

@@ -196,7 +196,7 @@ Both modes share the same daily submission quota — in kaggle mode, one entry (
 - `public leaderboard [top=N] [order=best|mean] [values=on|off] [range=MIN:MAX] [axis=on|off] [median=on|off]` — kaggle mode only, see [Public leaderboard image](#public-leaderboard-image)
 - `all submits` — generate and upload a CSV of every submission in the system (every `Submission` column, plus a `candidates_in_batch` count)
 - `no submits` — roster members with no submissions at all
-- `user submits @user` — a specific user's submissions (use a real Zulip `@`-mention). In kaggle mode, one row per submit however many CSVs it had, with its candidate count, best public gain, that candidate's private gain, and the public mean ± std
+- `user submits @user [gain|mean|max|date] [asc|desc]` — a specific user's submissions (use a real Zulip `@`-mention). In kaggle mode, one row per submit however many CSVs it had, with its candidate count, best public gain, that candidate's private gain, and the public mean ± std. Sortable: `gain` is that private gain (the value grades use), `mean` the public mean, `max` the best public gain, `date` the submit time; default `date desc` (newest first). In blind mode `gain`, `mean` and `max` all sort by the submission's actual gain
 - `roster reload` — reload the roster from disk without restarting the bot
 - `grades` — generate and upload the grade CSV (see [Grading](#grading))
 - `baseline <name>` (attach one or more CSVs), `baseline list`, `baseline publish <id>`, `baseline hide <id>` — kaggle mode only, see [Baselines](#baselines)
