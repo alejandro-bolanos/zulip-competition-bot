@@ -19,7 +19,6 @@ use master_data::MasterData;
 use roster::Roster;
 use zulip::ZulipClient;
 
-use regex::Regex;
 
 #[derive(Parser)]
 #[command(name = "zulip-competition-bot")]
@@ -441,8 +440,8 @@ impl Bot {
             submission::process_no_submits(&self.db, &self.roster.borrow())
         } else if content.starts_with("user submits") && is_teacher {
             info!("Processing user submits command (teacher)");
-            if let Some(user_name) = self.extract_mentioned_user_name(&message.content) {
-                submission::process_user_submits(&user_name, &self.db)
+            if let Some(user_name) = submission::mentioned_user_name(&message.content) {
+                submission::process_user_submits(&user_name, &self.db, &self.config)
             } else {
                 "❌ Usage: user submits @user (use a Zulip mention)".to_string()
             }
@@ -556,21 +555,6 @@ impl Bot {
                 url
             ),
             Err(e) => format!("❌ Error uploading the image to Zulip: {}", e),
-        }
-    }
-
-    fn extract_mentioned_user_name(&self, content: &str) -> Option<String> {
-        let re = Regex::new(r"@\*\*([\w|\s]+)\*\*").ok()?;
-
-        if let Some(captures) = re.captures(content) {
-            if let Some(inner_match) = captures.get(1) {
-                let text = inner_match.as_str();
-                Some(text.to_string())
-            } else {
-                None
-            }
-        } else {
-            None
         }
     }
 

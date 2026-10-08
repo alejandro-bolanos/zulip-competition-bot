@@ -711,15 +711,15 @@ pub fn process_list_submits(user_id: i64, db: &Database, config: &BotConfig) -> 
 /// gain here would leak strictly more than the aggregate already does. Not
 /// gated by the reveal date at all -- the aggregate was already disclosed at
 /// submit time, so repeating it here isn't a new secret.
-fn list_submits_kaggle(submissions: &[Submission]) -> String {
-    // Groups candidate rows into batches without assuming they're adjacent
-    // in `submissions` -- only that every row of one batch shares an
-    // identical timestamp (true by construction, see `process_kaggle_submit`)
-    // and that two different batches never share one (wall-clock, effectively
-    // impossible to collide). So the first time each batch_id is seen already
-    // reflects `submissions`' own order (timestamp DESC out of the DB); no
-    // separate sort is needed, and candidates within a batch may be
-    // collected in any relative order without changing what's displayed.
+/// Groups candidate rows into one entry per submit (`batch_id`, or the row's
+/// own id when it has none), keeping `submissions`' order of first
+/// appearance. Doesn't assume a batch's rows are adjacent -- only that every
+/// row of one batch shares an identical timestamp (true by construction, see
+/// `build_kaggle_batch`) and that two batches never share one (wall-clock,
+/// effectively impossible to collide). So with `submissions` in timestamp
+/// DESC order, as the DB returns it, the batches come out newest first with
+/// no separate sort, and the order of candidates within a batch doesn't matter.
+fn group_by_batch(submissions: &[Submission]) -> Vec<(String, Vec<&Submission>)> {
     let mut batches: HashMap<String, Vec<&Submission>> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for sub in submissions {
@@ -732,13 +732,21 @@ fn list_submits_kaggle(submissions: &[Submission]) -> String {
         }
         batches.entry(key).or_default().push(sub);
     }
+    order
+        .into_iter()
+        .map(|key| {
+            let rows = batches.remove(&key).expect("every ordered key was inserted");
+            (key, rows)
+        })
+        .collect()
+}
 
+fn list_submits_kaggle(submissions: &[Submission]) -> String {
     let mut response = "📋 **Your Submissions:**\n\n".to_string();
     response.push_str("| Name | 📅 Date | 🔢 Candidates | 📊 Public mean | 📉 Public std | 🆔 Batch | ⏰ |\n");
     response.push_str("|---|---|---|---|---|---|---|\n");
 
-    for key in &order {
-        let rows = &batches[key];
+    for (key, rows) in &group_by_batch(submissions) {
         let gains: Vec<f64> = rows.iter().filter_map(|s| s.public_gain).collect();
         let (mean, std_dev) = mean_and_std(&gains);
         let deadline_mark = if rows[0].after_deadline { "⚠️" } else { "✅" };
@@ -1105,7 +1113,19 @@ pub async fn export_grades_csv(rows: &[GradeRow], client: &ZulipClient) -> Strin
     }
 }
 
-pub fn process_user_submits(user_identifier: &str, db: &Database) -> String {
+/// The name inside the first Zulip mention in `content` -- `@**Name**`, or
+/// `@**Name|123**`, the form Zulip uses to disambiguate two users with the
+/// same name (the `|123` user id is dropped). Accepts anything but `*` in
+/// the name, so hyphens, periods and apostrophes ("Diego R.", "O'Brien")
+/// work. Silent mentions (`@_**Name**`) are accepted too.
+pub fn mentioned_user_name(content: &str) -> Option<String> {
+    let re = Regex::new(r"@_?\*\*([^*]+)\*\*").expect("static regex");
+    let inner = re.captures(content)?.get(1)?.as_str();
+    let name = inner.split('|').next().unwrap_or(inner).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+pub fn process_user_submits(user_identifier: &str, db: &Database, config: &BotConfig) -> String {
     let submissions = match db.get_user_submissions_by_identifier(user_identifier) {
         Ok(s) => s,
         Err(e) => return format!("❌ Error retrieving submissions: {}", e),
@@ -1113,6 +1133,10 @@ pub fn process_user_submits(user_identifier: &str, db: &Database) -> String {
 
     if submissions.is_empty() {
         return format!("📋 No submissions found for '{}'", user_identifier);
+    }
+
+    if config.competition.mode == crate::config::CompetitionMode::Kaggle {
+        return user_submits_kaggle(user_identifier, &submissions);
     }
 
     let mut response = format!("📋 **Submissions for '{}':**\n\n", user_identifier);
@@ -1130,6 +1154,53 @@ pub fn process_user_submits(user_identifier: &str, db: &Database) -> String {
             fmt_gain(sub.expected_gain),
             sub.actual_gain,
             sub.threshold_category,
+            deadline_mark
+        ));
+    }
+
+    response
+}
+
+/// Kaggle mode's `user submits`: one row per submit, however many candidate
+/// CSVs it had. Teacher-only, so unlike a student's `list submits` it shows
+/// the private side too: the batch's best candidate on PUBLIC and that
+/// candidate's PRIVATE gain -- the exact value the leaderboard and grades
+/// use if this turns out to be the student's last pre-deadline batch.
+fn user_submits_kaggle(user_identifier: &str, submissions: &[Submission]) -> String {
+    let mut response = format!("📋 **Submissions for '{}':**\n\n", user_identifier);
+    response.push_str(
+        "| Name | 📅 Date | 🔢 Candidates | 🏆 Best public | 💰 Its private | 📊 Public mean ± std | 🆔 Batch | ⏰ |\n",
+    );
+    response.push_str("|---|---|---|---|---|---|---|---|\n");
+
+    for (key, rows) in &group_by_batch(submissions) {
+        let best = rows
+            .iter()
+            .max_by(|a, b| {
+                a.public_gain
+                    .partial_cmp(&b.public_gain)
+                    .expect("gains are never NaN")
+            })
+            .expect("a batch is never empty");
+        let gains: Vec<f64> = rows.iter().filter_map(|s| s.public_gain).collect();
+        let (mean, std_dev) = mean_and_std(&gains);
+        let name = if best.is_baseline {
+            format!("📐 {}", best.submission_name)
+        } else {
+            best.submission_name.clone()
+        };
+        let deadline_mark = if best.after_deadline { "⚠️" } else { "✅" };
+        let ts: String = best.timestamp.chars().take(16).collect();
+        response.push_str(&format!(
+            "|{}|{}|{}|{}|{}|{:.2} ± {:.2}|`{}`|{}|\n",
+            name,
+            ts,
+            rows.len(),
+            fmt_gain(best.public_gain),
+            fmt_gain(best.private_gain),
+            mean,
+            std_dev,
+            key,
             deadline_mark
         ));
     }
@@ -1935,6 +2006,63 @@ mod tests {
             response
         );
         assert!(response.contains("b1"), "batch id must be shown, to correlate with other commands: {}", response);
+    }
+
+    #[test]
+    fn user_submits_in_kaggle_mode_shows_one_row_per_batch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.init().unwrap();
+        // b1: three candidates; best on public (9.0) has private 30.0, while
+        // the highest PRIVATE (99.0) belongs to a weaker public candidate.
+        insert_kaggle_candidate(&db, 1, "b1", 5.0, 20.0, false);
+        insert_kaggle_candidate(&db, 1, "b1", 9.0, 30.0, false);
+        insert_kaggle_candidate(&db, 1, "b1", 1.0, 99.0, false);
+        insert_kaggle_candidate(&db, 1, "b2", 4.0, 7.0, true);
+
+        let mut config = test_config("./s", "2026-01-01T23:59:59");
+        config.competition.mode = crate::config::CompetitionMode::Kaggle;
+
+        let table = process_user_submits("u1@e.com", &db, &config);
+        let rows: Vec<&str> = table.lines().filter(|l| l.contains("`b")).collect();
+        assert_eq!(rows.len(), 2, "one row per batch, not per candidate: {table}");
+
+        let b1 = rows.iter().find(|l| l.contains("`b1`")).unwrap();
+        assert!(b1.contains("|3|"), "candidate count: {b1}");
+        assert!(b1.contains("|9.00|30.00|"), "best public and ITS private gain: {b1}");
+        assert!(!b1.contains("99.00"), "not the best private gain: {b1}");
+        assert!(b1.contains("5.00 ± 3.27"), "public mean ± std: {b1}");
+        assert!(b1.ends_with("✅|"), "{b1}");
+
+        let b2 = rows.iter().find(|l| l.contains("`b2`")).unwrap();
+        assert!(b2.contains("|1|") && b2.ends_with("⚠️|"), "late batch: {b2}");
+    }
+
+    #[test]
+    fn mentions_with_any_name_characters_are_parsed() {
+        let m = |s: &str| mentioned_user_name(s);
+        assert_eq!(m("user submits @**Ana Gómez**").as_deref(), Some("Ana Gómez"));
+        assert_eq!(m("user submits @**test-student-1-bot**").as_deref(), Some("test-student-1-bot"));
+        assert_eq!(m("user submits @**Diego R.**").as_deref(), Some("Diego R."));
+        assert_eq!(m("user submits @**O'Brien**").as_deref(), Some("O'Brien"));
+        assert_eq!(m("user submits @**Ana Gómez|42**").as_deref(), Some("Ana Gómez"), "drops Zulip's |id");
+        assert_eq!(m("user submits @_**Ana**").as_deref(), Some("Ana"), "silent mention");
+        assert_eq!(m("user submits Ana"), None);
+        assert_eq!(m("user submits @****"), None);
+    }
+
+    #[test]
+    fn user_submits_in_blind_mode_still_lists_each_submission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.init().unwrap();
+        insert_valid_submission(&db, 1, "a@e.com", "Ana", 10.0, false);
+        insert_valid_submission(&db, 2, "a2@e.com", "Ana B", 20.0, false);
+
+        let config = test_config("./s", "2026-01-01T23:59:59");
+        let table = process_user_submits("Ana", &db, &config);
+        assert!(table.contains("✨ Actual"), "blind keeps its own columns: {table}");
+        assert_eq!(table.lines().filter(|l| l.starts_with('|') && !l.starts_with("| ID") && !l.starts_with("|---")).count(), 2);
     }
 
     #[test]
