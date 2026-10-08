@@ -502,6 +502,21 @@ async fn build_kaggle_batch(
     Ok((batch_id, rows))
 }
 
+/// The candidate a kaggle batch is scored by: best on public, ties going to
+/// the highest id -- exactly the `ORDER BY public_gain DESC, id DESC` that
+/// `get_leaderboard` and `get_baselines` use, so any view showing "its
+/// private gain" shows the value grades actually use. Rows not yet saved
+/// have no id; among those, the last one wins, which is the one `save_batch`
+/// will give the highest id.
+fn best_on_public<'a>(rows: impl IntoIterator<Item = &'a Submission>) -> Option<&'a Submission> {
+    rows.into_iter().max_by(|a, b| {
+        a.public_gain
+            .partial_cmp(&b.public_gain)
+            .expect("gains are never NaN")
+            .then(a.id.cmp(&b.id))
+    })
+}
+
 /// Max candidate CSVs in one `baseline` upload. Teachers aren't on the
 /// roster, so there's no per-person `max_files_per_submission` to read; this
 /// only guards against an accidental huge upload.
@@ -585,14 +600,7 @@ pub async fn process_baseline_upload(
     }
 
     // Same "best on public, then its private gain" rule as a competitor's batch.
-    let best = rows
-        .iter()
-        .max_by(|a, b| {
-            a.public_gain
-                .partial_cmp(&b.public_gain)
-                .expect("gains are never NaN")
-        })
-        .expect("build_kaggle_batch never returns an empty batch");
+    let best = best_on_public(&rows).expect("build_kaggle_batch never returns an empty batch");
 
     format!(
         "📐 **Baseline stored:** {name} ({n} candidate{s})\n\
@@ -1293,14 +1301,7 @@ fn user_submits_kaggle(user_identifier: &str, submissions: &[Submission], order:
     let mut batches: Vec<BatchRow> = group_by_batch(submissions)
         .into_iter()
         .map(|(key, rows)| {
-            let best = *rows
-                .iter()
-                .max_by(|a, b| {
-                    a.public_gain
-                        .partial_cmp(&b.public_gain)
-                        .expect("gains are never NaN")
-                })
-                .expect("a batch is never empty");
+            let best = best_on_public(rows.iter().copied()).expect("a batch is never empty");
             let gains: Vec<f64> = rows.iter().filter_map(|s| s.public_gain).collect();
             let (mean, std_dev) = mean_and_std(&gains);
             BatchRow { key, candidates: rows.len(), best, mean, std_dev }
@@ -2285,6 +2286,26 @@ mod tests {
         assert_eq!(gains(""), ["30.00", "10.00", "20.00"], "default: newest first");
         assert_eq!(gains(" gain"), ["30.00", "20.00", "10.00"]);
         assert_eq!(gains(" mean asc"), ["10.00", "20.00", "30.00"], "mean/max mean the single gain in blind mode");
+    }
+
+    #[test]
+    fn user_submits_breaks_public_gain_ties_the_way_grading_does() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::new(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.init().unwrap();
+        // Tied on public gain. The leaderboard/grades SQL breaks the tie by
+        // `id DESC`, so the later candidate (private 20.0) is the graded one.
+        insert_kaggle_candidate(&db, 1, "tie", 5.0, 10.0, false);
+        insert_kaggle_candidate(&db, 1, "tie", 5.0, 20.0, false);
+
+        let mut config = test_config("./s", "2026-01-01T23:59:59");
+        config.competition.mode = crate::config::CompetitionMode::Kaggle;
+
+        let graded = db.get_leaderboard("gain", config.competition.mode).unwrap()[0].3;
+        assert_eq!(graded, 20.0, "precondition: the grading rule picks the later candidate");
+
+        let table = process_user_submits("u1@e.com", SubmitOrder::default(), &db, &config);
+        assert!(table.contains("|5.00|20.00|"), "must show the graded candidate's private gain: {table}");
     }
 
     #[test]

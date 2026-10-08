@@ -392,7 +392,7 @@ def phase_before_deadline(
     # expected value comes from the closed form, not from the bot.
     expected = fx.expected_gain(n_pos, n_neg)
     reply = teacher.ask(bot, f"user submits @**{a.display_name}**")
-    r.contains("teacher sees the submission", reply, "modelo-a")
+    r.contains("teacher sees the submission", reply, "model-a")
     r.contains(f"scored gain is {expected:g} as computed here", reply, f"{expected:.2f}")
 
     reply = teacher.ask(bot, "leaderboard")
