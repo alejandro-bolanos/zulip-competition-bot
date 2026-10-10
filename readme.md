@@ -164,7 +164,7 @@ All commands are sent as Zulip private messages to the bot.
 
 - `submit <name> <expected_gain>` — submit a model (attach one CSV)
 - `reveal <name> <expected_gain>` — like `submit`, but spends one golden bullet to see the real gain and threshold category immediately, instead of waiting for `results_reveal_date`
-- `list submits` — list your own submissions
+- `list submits` — your submissions from the last 2 days, plus a CSV of your full history (see [`list submits`](#list-submits))
 - `help` — show this help
 
 Your final result is your **last** pre-deadline submission, not your best one — choose carefully what you send last.
@@ -172,7 +172,7 @@ Your final result is your **last** pre-deadline submission, not your best one �
 ### Students — kaggle mode
 
 - `submit <name>` — submit one or more candidate CSVs (one Zulip message, multiple attachments = one entry). No expected gain to type — the reply immediately shows the mean and standard deviation of the *public* gain across your candidates, never any individual candidate's score.
-- `list submits` — list your own submissions, one row per batch (candidate count and public mean/std, not per-candidate detail)
+- `list submits` — your submissions from the last 2 days, one row per batch (candidate count and public mean/std, not per-candidate detail), plus a CSV of your full history (see [`list submits`](#list-submits))
 - `help` — show this help
 
 Your final result is your **last** pre-deadline submission, not your best one — choose carefully what you send last. Within that submission, the candidate with the best *public* gain is the one scored against the *private* split.
@@ -196,13 +196,19 @@ Both modes share the same daily submission quota — in kaggle mode, one entry (
 - `public leaderboard [top=N] [order=best|mean] [values=on|off] [range=MIN:MAX] [axis=on|off] [median=on|off]` — kaggle mode only, see [Public leaderboard image](#public-leaderboard-image)
 - `all submits` — generate and upload a CSV of every submission in the system (every `Submission` column, plus a `candidates_in_batch` count)
 - `no submits` — roster members with no submissions at all
-- `user submits @user` — a specific user's submissions (use a real Zulip `@`-mention)
+- `user submits @user [gain|mean|max|date] [asc|desc]` — a specific user's submissions (use a real Zulip `@`-mention). In kaggle mode, one row per submit however many CSVs it had, with its candidate count, best public gain, that candidate's private gain, and the public mean ± std. Sortable: `gain` is that private gain (the value grades use), `mean` the public mean, `max` the best public gain, `date` the submit time; default `date desc` (newest first). In blind mode `gain`, `mean` and `max` all sort by the submission's actual gain
 - `roster reload` — reload the roster from disk without restarting the bot
 - `grades` — generate and upload the grade CSV (see [Grading](#grading))
 - `baseline <name>` (attach one or more CSVs), `baseline list`, `baseline publish <id>`, `baseline hide <id>` — kaggle mode only, see [Baselines](#baselines)
 - `help` — show this help
 
 Teachers cannot `submit` models as competitors. In kaggle mode they can upload reference models with `baseline` instead, which are never ranked or graded.
+
+### `list submits`
+
+The message shows the submissions from the **last two days**: today and yesterday by the competition's own calendar (the same `timezone_offset_minutes` clock as the deadline and the daily quota), so a submit made at 11pm in Argentina counts as that day, not as tomorrow's UTC. Dates in the table are shown in that timezone, and the heading says which. Everything older is not lost: the reply links a **CSV with your full history**, newest first, with exactly the columns the table has. The CSV is plain text: no emoji, backticks or `±`, `yes`/`no` for `on_time`, separate `public_mean` and `public_std` columns, full-precision numbers, and dates as `YYYY-MM-DD HH:MM:SS` in competition time.
+
+Both honor the same visibility rules, so neither reveals more than the other: in kaggle mode only the batch's public mean/std (never a private gain), and in blind mode no actual gain until `results_reveal_date`, after which both gain the `actual_gain` column. If the last two days hold more rows than fit in one Zulip message (it cuts anything over 10,000 characters), the newest are shown and the message states how many more are only in the CSV.
 
 ## Competition modes
 

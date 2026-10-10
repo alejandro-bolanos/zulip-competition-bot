@@ -19,7 +19,6 @@ use master_data::MasterData;
 use roster::Roster;
 use zulip::ZulipClient;
 
-use regex::Regex;
 
 #[derive(Parser)]
 #[command(name = "zulip-competition-bot")]
@@ -375,7 +374,7 @@ impl Bot {
             }
         } else if content == "list submits" && !is_teacher {
             info!("Processing list submits command");
-            submission::process_list_submits(message.sender_id, &self.db, &self.config)
+            submission::process_list_submits(message.sender_id, &self.db, &self.config, &self.client).await
         } else if content == "duplicates" && is_teacher {
             info!("Processing duplicates command (teacher)");
             submission::process_duplicates(&self.db)
@@ -441,10 +440,14 @@ impl Bot {
             submission::process_no_submits(&self.db, &self.roster.borrow())
         } else if content.starts_with("user submits") && is_teacher {
             info!("Processing user submits command (teacher)");
-            if let Some(user_name) = self.extract_mentioned_user_name(&message.content) {
-                submission::process_user_submits(&user_name, &self.db)
-            } else {
-                "❌ Usage: user submits @user (use a Zulip mention)".to_string()
+            match submission::split_mention(&message.content) {
+                Some((user_name, rest)) => match submission::parse_submit_order(rest) {
+                    Ok(order) => {
+                        submission::process_user_submits(&user_name, order, &self.db, &self.config)
+                    }
+                    Err(usage) => usage,
+                },
+                None => submission::user_submits_usage("Mention the user with a real Zulip @-mention."),
             }
         } else if content == "roster reload" && is_teacher {
             info!("Processing roster reload command (teacher)");
@@ -559,21 +562,6 @@ impl Bot {
         }
     }
 
-    fn extract_mentioned_user_name(&self, content: &str) -> Option<String> {
-        let re = Regex::new(r"@\*\*([\w|\s]+)\*\*").ok()?;
-
-        if let Some(captures) = re.captures(content) {
-            if let Some(inner_match) = captures.get(1) {
-                let text = inner_match.as_str();
-                Some(text.to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
     fn get_help_message(&self, is_teacher: bool) -> String {
         let comp = &self.config.competition;
         let mode = comp.mode;
@@ -622,7 +610,7 @@ impl Bot {
                 {}\
                 • `all submits` - Generate and upload a CSV of every submission in the system\n\
                 • `no submits` - View roster members with no submission at all\n\
-                • `user submits @user` - View a user's submissions (use an @ mention)\n\
+                • `user submits @user [gain|mean|max|date] [asc|desc]` - View a user's submissions (use an @ mention), sorted (default: newest first)\n\
                 • `roster reload` - Reload the roster from the CSV\n\
                 • `grades` - Generate and upload the grades CSV (10 at the max, 8 at the median, linear in between)\n\
                 • `help` - Show this help\n\n\
