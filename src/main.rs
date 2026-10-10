@@ -374,7 +374,7 @@ impl Bot {
             }
         } else if content == "list submits" && !is_teacher {
             info!("Processing list submits command");
-            submission::process_list_submits(message.sender_id, &self.db, &self.config)
+            submission::process_list_submits(message.sender_id, &self.db, &self.config, &self.client).await
         } else if content == "duplicates" && is_teacher {
             info!("Processing duplicates command (teacher)");
             submission::process_duplicates(&self.db)

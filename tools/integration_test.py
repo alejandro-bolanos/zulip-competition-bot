@@ -45,6 +45,7 @@ import argparse
 import csv
 import io
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -132,6 +133,24 @@ class Identity:
         if not uri:
             raise RuntimeError(f"no uri in upload response: {body}")
         return uri
+
+    def fetch_linked_csv(self, reply: str) -> list[list[str]] | None:
+        """Downloads the `.csv` a bot reply links to, as this account (the
+        uploads are only readable by the people the message went to), and
+        returns its rows -- header first -- or None if the reply has no link.
+        Also asserts nothing itself; callers check what they care about."""
+        match = re.search(r"\]\(([^)\s]+\.csv)\)", reply)
+        if match is None:
+            return None
+        url = match.group(1)
+        if url.startswith("/"):
+            url = self.site + url
+        response = self.session.get(url, auth=self.auth, timeout=30)
+        response.raise_for_status()
+        text = response.content.decode()
+        if not text.isascii():
+            raise AssertionError(f"CSV contains non-ASCII characters:\n{text}")
+        return list(csv.reader(io.StringIO(text)))
 
     def send_dm(self, to_email: str, content: str) -> int:
         response = self.session.post(
@@ -365,6 +384,19 @@ def phase_before_deadline(
     r.contains("submission is listed", reply, "model-a")
     r.excludes("list submits hides the real gain before reveal", reply, "✨")
     r.contains("reveal date is announced", reply, "will be revealed")
+    r.contains("it says the table covers the last 2 days", reply, "last 2 days")
+    table = a.fetch_linked_csv(reply)
+    if r.check("list submits attaches the full history as a CSV", table is not None, reply):
+        r.check(
+            "blind CSV hides the actual gain before the reveal, like the table",
+            table[0] == ["id", "name", "submitted_at", "expected_gain", "category", "on_time"],
+            str(table[0]),
+        )
+        r.check(
+            "blind CSV has one row for the one submit, in plain yes/no",
+            len(table) == 2 and table[1][1] == "model-a" and table[1][-1] == "yes",
+            str(table),
+        )
 
     # Rejections.
     reply = a.submit(bot, "bad", 1.0, f"{fx.unknown_id}\n")
@@ -424,6 +456,18 @@ def phase_after_reveal(r: Results, bot: str, a: Identity) -> None:
 
     reply = a.ask(bot, "list submits")
     r.contains("student now sees the real gain column", reply, "✨")
+    table = a.fetch_linked_csv(reply)
+    if r.check("list submits still attaches the CSV after the reveal", table is not None, reply):
+        r.check(
+            "blind CSV gains the actual_gain column after the reveal",
+            table[0] == ["id", "name", "submitted_at", "expected_gain", "actual_gain", "category", "on_time"],
+            str(table[0]),
+        )
+        r.check(
+            "the late submit is in the CSV, marked on_time=no",
+            any(row[-1] == "no" for row in table[1:]),
+            str(table),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -531,6 +575,30 @@ def phase_kaggle_before_deadline(
         reply,
         f"{expected_private:.2f}",
     )
+    r.contains("it says the table covers the last 2 days", reply, "last 2 days")
+    table = a.fetch_linked_csv(reply)
+    if r.check("list submits attaches the full history as a CSV", table is not None, reply):
+        r.check(
+            "kaggle CSV has the table's columns, in plain names",
+            table[0] == ["name", "submitted_at", "candidates", "public_mean", "public_std", "batch_id", "on_time"],
+            str(table[0]),
+        )
+        model_a = [row for row in table[1:] if row[0] == "model-a"]
+        r.check(
+            "kaggle CSV has ONE row for the 2-candidate batch",
+            len(model_a) == 1 and model_a[0][2] == "2",
+            str(table),
+        )
+        r.check(
+            "kaggle CSV carries the public mean at full precision",
+            len(model_a) == 1 and abs(float(model_a[0][3]) - expected_public_mean) < 1e-6,
+            f"{model_a} vs {expected_public_mean}",
+        )
+        r.check(
+            "kaggle CSV never contains the private gain",
+            all(cell != f"{expected_private:g}" for row in table for cell in row),
+            str(table),
+        )
 
     reply = a.ask(bot, "reveal model-b 1")
     r.contains("reveal is unavailable in kaggle mode", reply, "not available")
