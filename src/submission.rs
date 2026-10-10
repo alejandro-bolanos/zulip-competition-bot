@@ -694,7 +694,153 @@ fn results_revealed(config: &BotConfig) -> bool {
     }
 }
 
-pub fn process_list_submits(user_id: i64, db: &Database, config: &BotConfig) -> String {
+/// The largest `text` `build_student_listing` will produce, in characters.
+/// Zulip silently cuts a message at 10,000 characters (`[message truncated]`,
+/// mid-row, and the bot is told the send succeeded), so the table is kept
+/// well under that, with room for the CSV link appended afterwards.
+const LISTING_BUDGET: usize = 9000;
+/// Characters set aside inside the budget for footers and the CSV link line.
+const LISTING_FOOTER_RESERVE: usize = 600;
+
+/// A student's `list submits`, built but not yet sent.
+pub struct StudentListing {
+    /// The message: a heading, the table for the last two days, footnotes.
+    /// Never contains the CSV link -- that needs an upload, see
+    /// `process_list_submits`.
+    pub text: String,
+    /// Every submit, ever, as plain CSV: the same columns the table shows
+    /// (nothing the table hides), but with no emoji, backticks or `±`.
+    pub csv: Vec<u8>,
+    /// Submits in the CSV (batches, in kaggle mode).
+    pub total: usize,
+}
+
+/// One submit as `list submits` shows it, in both of its forms.
+struct ListEntry {
+    /// As stored (RFC3339), to decide whether it's in the two-day window.
+    timestamp: String,
+    /// The markdown table row, newline-terminated.
+    row: String,
+    /// The same submit as CSV fields.
+    csv: Vec<String>,
+}
+
+/// Everything that differs between modes (and between before and after the
+/// reveal date in blind mode): the columns, the entries, the footnote.
+struct ListView {
+    table_header: &'static str,
+    csv_header: &'static [&'static str],
+    entries: Vec<ListEntry>,
+    footer: Option<String>,
+}
+
+/// The competition's clock -- the one `timezone_offset_minutes` governs for
+/// the deadline and the daily quota -- so "the last two days" means the
+/// student's own days, not UTC's. An out-of-range offset (rejected by
+/// `validate()`, so unreachable in practice) falls back to UTC.
+fn competition_tz(config: &BotConfig) -> chrono::FixedOffset {
+    chrono::FixedOffset::east_opt(config.competition.timezone_offset_minutes * 60)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("zero offset is valid"))
+}
+
+/// `ts` as local competition time in `format`; the raw stored text if it
+/// somehow doesn't parse, rather than hiding a submit over a bad timestamp.
+fn local_time(ts: &str, tz: chrono::FixedOffset, format: &str) -> String {
+    match parse_timestamp(ts) {
+        Some(t) => t.with_timezone(&tz).format(format).to_string(),
+        None => ts.to_string(),
+    }
+}
+
+fn yes_no(flag: bool) -> &'static str {
+    if flag {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// Builds a student's `list submits` from their stored rows (newest first,
+/// as the DB returns them): a table of the last two local days, and a CSV of
+/// the full history. `now` is a parameter so the window is testable.
+pub fn build_student_listing(
+    submissions: &[Submission],
+    config: &BotConfig,
+    now: DateTime<Utc>,
+) -> Result<StudentListing> {
+    let tz = competition_tz(config);
+    let view = match config.competition.mode {
+        crate::config::CompetitionMode::Kaggle => kaggle_view(submissions, tz),
+        crate::config::CompetitionMode::Blind => blind_view(submissions, config, tz),
+    };
+
+    // Today and yesterday, by the competition's calendar.
+    let window_start = config.competition.local_day_bounds_utc(now).0 - chrono::Duration::days(1);
+    let recent: Vec<&ListEntry> = view
+        .entries
+        .iter()
+        .filter(|e| parse_timestamp(&e.timestamp).is_none_or(|t| t >= window_start))
+        .collect();
+
+    let mut text = format!(
+        "📋 **Your Submissions** -- last 2 days (since {}, times in {})\n\n",
+        window_start.with_timezone(&tz).format("%Y-%m-%d"),
+        now.with_timezone(&tz).format("UTC%:z"),
+    );
+
+    let header_chars = view.table_header.chars().count();
+    let mut used = text.chars().count() + header_chars + LISTING_FOOTER_RESERVE;
+    let fits = recent
+        .iter()
+        .take_while(|e| {
+            used += e.row.chars().count();
+            used <= LISTING_BUDGET
+        })
+        .count();
+
+    if recent.is_empty() {
+        text.push_str("No submits in the last 2 days.\n");
+    } else {
+        if fits > 0 {
+            text.push_str(view.table_header);
+            for entry in &recent[..fits] {
+                text.push_str(&entry.row);
+            }
+        }
+        if fits < recent.len() {
+            text.push_str(&format!(
+                "\n…and {} more from these two days, only in the CSV.\n",
+                recent.len() - fits
+            ));
+        }
+    }
+    if let Some(footer) = &view.footer {
+        text.push_str(&format!("\n{footer}"));
+    }
+
+    let mut writer = csv::Writer::from_writer(vec![]);
+    writer.write_record(view.csv_header)?;
+    for entry in &view.entries {
+        writer.write_record(&entry.csv)?;
+    }
+    writer.flush()?;
+
+    Ok(StudentListing {
+        text,
+        csv: writer.into_inner()?,
+        total: view.entries.len(),
+    })
+}
+
+/// Sends a student's `list submits`: the last two days in the message, and
+/// the whole history as a CSV attachment (uploaded like `grades`' and
+/// `all submits`'). If the upload fails the table is still sent, with a note.
+pub async fn process_list_submits(
+    user_id: i64,
+    db: &Database,
+    config: &BotConfig,
+    client: &ZulipClient,
+) -> String {
     let submissions = match db.get_user_submissions(user_id) {
         Ok(s) => s,
         Err(e) => return format!("❌ Error retrieving submissions: {}", e),
@@ -704,21 +850,25 @@ pub fn process_list_submits(user_id: i64, db: &Database, config: &BotConfig) -> 
         return "📋 You have no recorded submissions".to_string();
     }
 
-    match config.competition.mode {
-        crate::config::CompetitionMode::Kaggle => list_submits_kaggle(&submissions),
-        crate::config::CompetitionMode::Blind => list_submits_blind(&submissions, config),
+    let StudentListing { text, csv, total } =
+        match build_student_listing(&submissions, config, Utc::now()) {
+            Ok(listing) => listing,
+            Err(e) => return format!("❌ Error preparing your submissions: {}", e),
+        };
+
+    let filename = format!("my_submissions_{}.csv", Utc::now().format("%Y%m%d_%H%M%S"));
+    match client.upload_file(&filename, csv, "text/csv").await {
+        Ok(url) => format!(
+            "{text}\n\n📎 **Full history** ({total} submit{}, CSV): [{filename}]({url})",
+            if total == 1 { "" } else { "s" },
+        ),
+        Err(e) => {
+            warn!("Could not upload {}'s submissions CSV: {}", user_id, e);
+            format!("{text}\n\n⚠️ Couldn't attach your full history as a CSV right now -- try again in a moment.")
+        }
     }
 }
 
-/// Kaggle mode: one row per BATCH (submit call), showing the mean/std of its
-/// candidates' PUBLIC gain -- the same aggregate the submit reply itself
-/// showed, never any individual candidate's score. Never `actual_gain`
-/// either (which mirrors the reveal-gated PRIVATE gain for kaggle rows);
-/// that value stays hidden until a teacher reads the leaderboard for this
-/// student's last pre-deadline batch, and showing even one candidate's own
-/// gain here would leak strictly more than the aggregate already does. Not
-/// gated by the reveal date at all -- the aggregate was already disclosed at
-/// submit time, so repeating it here isn't a new secret.
 /// Groups candidate rows into one entry per submit (`batch_id`, or the row's
 /// own id when it has none), keeping `submissions`' order of first
 /// appearance. Doesn't assume a batch's rows are adjacent -- only that every
@@ -749,88 +899,135 @@ fn group_by_batch(submissions: &[Submission]) -> Vec<(String, Vec<&Submission>)>
         .collect()
 }
 
-fn list_submits_kaggle(submissions: &[Submission]) -> String {
-    let mut response = "📋 **Your Submissions:**\n\n".to_string();
-    response.push_str("| Name | 📅 Date | 🔢 Candidates | 📊 Public mean | 📉 Public std | 🆔 Batch | ⏰ |\n");
-    response.push_str("|---|---|---|---|---|---|---|\n");
+/// Kaggle mode: one row per BATCH (submit call), showing the mean/std of its
+/// candidates' PUBLIC gain -- the same aggregate the submit reply itself
+/// showed, never any individual candidate's score. Never `actual_gain`
+/// either (which mirrors the reveal-gated PRIVATE gain for kaggle rows);
+/// that value stays hidden until a teacher reads the leaderboard for this
+/// student's last pre-deadline batch, and showing even one candidate's own
+/// gain here -- in the table or the CSV -- would leak strictly more than the
+/// aggregate already does. Not gated by the reveal date at all: the
+/// aggregate was already disclosed at submit time, so repeating it isn't a
+/// new secret.
+fn kaggle_view(submissions: &[Submission], tz: chrono::FixedOffset) -> ListView {
+    let entries = group_by_batch(submissions)
+        .into_iter()
+        .map(|(key, rows)| {
+            let gains: Vec<f64> = rows.iter().filter_map(|s| s.public_gain).collect();
+            let (mean, std_dev) = mean_and_std(&gains);
+            let first = rows[0];
+            ListEntry {
+                timestamp: first.timestamp.clone(),
+                row: format!(
+                    "|{}|{}|{}|{:.2}|{:.2}|`{}`|{}|\n",
+                    first.submission_name,
+                    local_time(&first.timestamp, tz, "%Y-%m-%d %H:%M"),
+                    rows.len(),
+                    mean,
+                    std_dev,
+                    key,
+                    if first.after_deadline { "⚠️" } else { "✅" },
+                ),
+                csv: vec![
+                    first.submission_name.clone(),
+                    local_time(&first.timestamp, tz, "%Y-%m-%d %H:%M:%S"),
+                    rows.len().to_string(),
+                    mean.to_string(),
+                    std_dev.to_string(),
+                    key,
+                    yes_no(!first.after_deadline).to_string(),
+                ],
+            }
+        })
+        .collect();
 
-    for (key, rows) in &group_by_batch(submissions) {
-        let gains: Vec<f64> = rows.iter().filter_map(|s| s.public_gain).collect();
-        let (mean, std_dev) = mean_and_std(&gains);
-        let deadline_mark = if rows[0].after_deadline { "⚠️" } else { "✅" };
-        let ts_str: String = rows[0].timestamp.chars().take(16).collect();
-        response.push_str(&format!(
-            "|{}|{}|{}|{:.2}|{:.2}|`{}`|{}|\n",
-            rows[0].submission_name,
-            ts_str,
-            rows.len(),
-            mean,
-            std_dev,
-            key,
-            deadline_mark
-        ));
+    ListView {
+        table_header: "| Name | 📅 Date | 🔢 Candidates | 📊 Public mean | 📉 Public std | 🆔 Batch | ⏰ |\n\
+                       |---|---|---|---|---|---|---|\n",
+        csv_header: &["name", "submitted_at", "candidates", "public_mean", "public_std", "batch_id", "on_time"],
+        entries,
+        footer: Some("ℹ️ The private gain is only known for your LAST pre-deadline submission.".to_string()),
     }
-
-    response.push_str(
-        "\nℹ️ The private gain is only known for your LAST pre-deadline submission.",
-    );
-    response
 }
 
-fn list_submits_blind(submissions: &[Submission], config: &BotConfig) -> String {
+/// Blind mode: one row per submission. Before `results_reveal_date` the
+/// actual gain is hidden -- from the table and the CSV alike, which show
+/// exactly the same columns -- and a note says when it will be revealed.
+fn blind_view(submissions: &[Submission], config: &BotConfig, tz: chrono::FixedOffset) -> ListView {
     let show_results = results_revealed(config);
 
-    let mut response = "📋 **Your Submissions:**\n\n".to_string();
+    let entries = submissions
+        .iter()
+        .map(|sub| {
+            let date = local_time(&sub.timestamp, tz, "%Y-%m-%d %H:%M");
+            let mark = if sub.after_deadline { "⚠️" } else { "✅" };
+            let mut csv = vec![
+                sub.id.unwrap_or(0).to_string(),
+                sub.submission_name.clone(),
+                local_time(&sub.timestamp, tz, "%Y-%m-%d %H:%M:%S"),
+                sub.expected_gain.map(|g| g.to_string()).unwrap_or_default(),
+            ];
+            if show_results {
+                csv.push(sub.actual_gain.to_string());
+            }
+            csv.push(sub.threshold_category.clone());
+            csv.push(yes_no(!sub.after_deadline).to_string());
 
-    if show_results {
-        // Show full information after the reveal date
-        response.push_str("| ID | Name | 📅 Date | 💰 Expected | ✨ Actual | 🎯 Category | ⏰ |\n");
-        response.push_str("|---|---|---|---|---|---|---|\n");
+            let row = if show_results {
+                format!(
+                    "|{}|{}|{}|{}|{:.2}|{}|{}|\n",
+                    sub.id.unwrap_or(0),
+                    sub.submission_name,
+                    date,
+                    fmt_gain(sub.expected_gain),
+                    sub.actual_gain,
+                    sub.threshold_category,
+                    mark
+                )
+            } else {
+                format!(
+                    "|{}|{}|{}|{}|{}|{}|\n",
+                    sub.id.unwrap_or(0),
+                    sub.submission_name,
+                    date,
+                    fmt_gain(sub.expected_gain),
+                    sub.threshold_category,
+                    mark
+                )
+            };
+            ListEntry {
+                timestamp: sub.timestamp.clone(),
+                row,
+                csv,
+            }
+        })
+        .collect();
 
-        for sub in submissions {
-            let deadline_mark = if sub.after_deadline { "⚠️" } else { "✅" };
-            let ts_str: String = sub.timestamp.chars().take(16).collect();
-            response.push_str(&format!(
-                "|{}|{}|{}|{}|{:.2}|{}|{}|\n",
-                sub.id.unwrap_or(0),
-                sub.submission_name,
-                ts_str,
-                fmt_gain(sub.expected_gain),
-                sub.actual_gain,
-                sub.threshold_category,
-                deadline_mark
-            ));
-        }
+    let (table_header, csv_header): (&'static str, &'static [&'static str]) = if show_results {
+        (
+            "| ID | Name | 📅 Date | 💰 Expected | ✨ Actual | 🎯 Category | ⏰ |\n\
+             |---|---|---|---|---|---|---|\n",
+            &["id", "name", "submitted_at", "expected_gain", "actual_gain", "category", "on_time"],
+        )
     } else {
-        // Show limited information before the reveal date
-        response.push_str("| ID | Name | 📅 Date | 💰 Expected | 🎯 Category | ⏰ |\n");
-        response.push_str("|---|---|---|---|---|---|\n");
+        (
+            "| ID | Name | 📅 Date | 💰 Expected | 🎯 Category | ⏰ |\n\
+             |---|---|---|---|---|---|\n",
+            &["id", "name", "submitted_at", "expected_gain", "category", "on_time"],
+        )
+    };
 
-        for sub in submissions {
-            let deadline_mark = if sub.after_deadline { "⚠️" } else { "✅" };
-            let ts_str: String = sub.timestamp.chars().take(16).collect();
-            response.push_str(&format!(
-                "|{}|{}|{}|{}|{}|{}|\n",
-                sub.id.unwrap_or(0),
-                sub.submission_name,
-                ts_str,
-                fmt_gain(sub.expected_gain),
-                sub.threshold_category,
-                deadline_mark
-            ));
-        }
-    }
+    let footer = (!show_results).then(|| {
+        let reveal_str: String = config.competition.results_reveal_date.chars().take(16).collect();
+        format!("📊 *Full results will be revealed on {}*", reveal_str)
+    });
 
-    // State when full results will be revealed, if not yet revealed
-    if !show_results {
-        let reveal_date = &config.competition.results_reveal_date;
-        let reveal_str: String = reveal_date.chars().take(16).collect();
-        response.push_str(&format!(
-            "\n📊 *Full results will be revealed on {}*",
-            reveal_str
-        ));
+    ListView {
+        table_header,
+        csv_header,
+        entries,
+        footer,
     }
-    response
 }
 
 pub fn process_duplicates(db: &Database) -> String {
@@ -2144,7 +2341,15 @@ mod tests {
         let mut config = test_config("./s", "2000-01-01T00:00:00");
         config.competition.mode = crate::config::CompetitionMode::Kaggle;
 
-        let response = process_list_submits(1, &db, &config);
+        let subs = db.get_user_submissions(1).unwrap();
+        let listing = build_student_listing(&subs, &config, Utc::now()).unwrap();
+        let response = listing.text.clone();
+        let csv = String::from_utf8(listing.csv).unwrap();
+        assert!(
+            !csv.contains("999"),
+            "private gain must never appear in the CSV either: {}",
+            csv
+        );
         assert!(response.contains("5.00"), "public gain must be shown: {}", response);
         assert!(
             !response.contains("999.00") && !response.contains("999.0"),
@@ -2152,6 +2357,207 @@ mod tests {
             response
         );
         assert!(response.contains("b1"), "batch id must be shown, to correlate with other commands: {}", response);
+    }
+
+    // ---- Student `list submits`: two-day window + full CSV ----------------
+
+    /// 2026-10-10 12:00 in the competition's UTC-03:00.
+    fn listing_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-10T15:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    fn listing_config(mode: crate::config::CompetitionMode) -> BotConfig {
+        let mut config = test_config("./s", "2099-01-01T00:00:00");
+        config.competition.mode = mode;
+        config.competition.timezone_offset_minutes = -180;
+        config
+    }
+
+    fn kaggle_row(name: &str, batch_id: &str, timestamp: &str, public: f64, private: f64) -> Submission {
+        Submission {
+            id: None,
+            user_id: 1,
+            user_email: "u1@e.com".to_string(),
+            user_full_name: "T".to_string(),
+            submission_name: name.to_string(),
+            timestamp: timestamp.to_string(),
+            file_checksum: "c".to_string(),
+            file_path: "/tmp/x.csv".to_string(),
+            expected_gain: None,
+            actual_gain: private,
+            tp: 0,
+            tn: 0,
+            fp: 0,
+            fn_: 0,
+            positives_predicted: 0,
+            threshold_category: "kaggle".to_string(),
+            after_deadline: false,
+            used_golden_bullet: false,
+            batch_id: Some(batch_id.to_string()),
+            public_gain: Some(public),
+            private_gain: Some(private),
+            is_baseline: false,
+            baseline_published: false,
+        }
+    }
+
+    fn blind_row(id: i64, name: &str, timestamp: &str, expected: f64, actual: f64) -> Submission {
+        let mut s = kaggle_row(name, "", timestamp, 0.0, 0.0);
+        s.id = Some(id);
+        s.batch_id = None;
+        s.public_gain = None;
+        s.private_gain = None;
+        s.expected_gain = Some(expected);
+        s.actual_gain = actual;
+        s.threshold_category = "ok".to_string();
+        s
+    }
+
+    fn csv_records(csv: &[u8]) -> (Vec<String>, Vec<Vec<String>>) {
+        let mut reader = csv::Reader::from_reader(csv);
+        let header = reader.headers().unwrap().iter().map(str::to_string).collect();
+        let rows = reader
+            .records()
+            .map(|r| r.unwrap().iter().map(str::to_string).collect())
+            .collect();
+        (header, rows)
+    }
+
+    #[test]
+    fn student_list_shows_two_local_days_and_the_csv_has_everything() {
+        // Newest first, as the DB returns them. Local times are UTC-3.
+        let subs = vec![
+            kaggle_row("today", "b5", "2026-10-10T12:00:00+00:00", 1.0, 1.0),          // 10th 09:00
+            kaggle_row("yest-late", "b4", "2026-10-10T02:59:59+00:00", 1.0, 1.0),      // 9th 23:59:59
+            kaggle_row("yest-start", "b3", "2026-10-09T03:00:00+00:00", 1.0, 1.0),     // 9th 00:00:00
+            kaggle_row("day-before", "b2", "2026-10-09T02:59:59+00:00", 1.0, 1.0),     // 8th 23:59:59
+            kaggle_row("old", "b1", "2026-10-01T12:00:00+00:00", 1.0, 1.0),
+        ];
+        let config = listing_config(crate::config::CompetitionMode::Kaggle);
+        let listing = build_student_listing(&subs, &config, listing_now()).unwrap();
+
+        for shown in ["today", "yest-late", "yest-start"] {
+            assert!(listing.text.contains(&format!("|{shown}|")), "{shown} is in the window: {}", listing.text);
+        }
+        for hidden in ["day-before", "old"] {
+            assert!(!listing.text.contains(&format!("|{hidden}|")), "{hidden} is outside it: {}", listing.text);
+        }
+        // The window follows the competition's calendar, not UTC's: the 9th
+        // 00:00 local is 03:00 UTC, so a submit at 02:59:59 UTC belongs to the 8th.
+        assert!(listing.text.contains("since 2026-10-09"), "{}", listing.text);
+        assert!(listing.text.contains("UTC-03:00"), "{}", listing.text);
+
+        let (header, rows) = csv_records(&listing.csv);
+        assert_eq!(header[0], "name");
+        let names: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(names, ["today", "yest-late", "yest-start", "day-before", "old"], "the CSV is the full history, newest first");
+        assert_eq!(listing.total, 5);
+    }
+
+    #[test]
+    fn student_list_dates_are_in_competition_time() {
+        let subs = vec![kaggle_row("m", "b1", "2026-10-10T02:30:15+00:00", 1.0, 1.0)];
+        let config = listing_config(crate::config::CompetitionMode::Kaggle);
+        let listing = build_student_listing(&subs, &config, listing_now()).unwrap();
+        assert!(listing.text.contains("|2026-10-09 23:30|"), "table: {}", listing.text);
+        let (_, rows) = csv_records(&listing.csv);
+        assert_eq!(rows[0][1], "2026-10-09 23:30:15", "CSV: full seconds, same clock");
+    }
+
+    #[test]
+    fn student_csv_is_plain_text_with_one_row_per_kaggle_batch() {
+        let mut late = kaggle_row("model-b", "b2", "2026-10-10T11:00:00+00:00", 3.0, 0.0);
+        late.after_deadline = true;
+        let subs = vec![
+            late,
+            kaggle_row("model-a", "b1", "2026-10-10T10:00:00+00:00", 5.5, 8675309.5),
+            kaggle_row("model-a", "b1", "2026-10-10T10:00:00+00:00", 7.25, 1.0),
+        ];
+        let config = listing_config(crate::config::CompetitionMode::Kaggle);
+        let listing = build_student_listing(&subs, &config, listing_now()).unwrap();
+        let csv = String::from_utf8(listing.csv.clone()).unwrap();
+
+        assert!(csv.is_ascii(), "no emoji or symbols in the file: {csv}");
+        assert!(!csv.contains('`') && !csv.contains('±') && !csv.contains('|'), "{csv}");
+        assert!(!csv.contains("8675309"), "the private gain never reaches the file: {csv}");
+
+        let (header, rows) = csv_records(&listing.csv);
+        assert_eq!(header, ["name", "submitted_at", "candidates", "public_mean", "public_std", "batch_id", "on_time"]);
+        assert_eq!(rows.len(), 2, "a 2-candidate submit is ONE row");
+        assert_eq!(rows[0], ["model-b", "2026-10-10 08:00:00", "1", "3", "0", "b2", "no"]);
+        // Full precision, not the table's 2 decimals: mean 6.375, population std 0.875.
+        assert_eq!(rows[1], ["model-a", "2026-10-10 07:00:00", "2", "6.375", "0.875", "b1", "yes"]);
+    }
+
+    #[test]
+    fn student_csv_round_trips_awkward_names() {
+        let subs = vec![kaggle_row("a,b\"c", "b1", "2026-10-10T10:00:00+00:00", 1.0, 1.0)];
+        let config = listing_config(crate::config::CompetitionMode::Kaggle);
+        let listing = build_student_listing(&subs, &config, listing_now()).unwrap();
+        let (_, rows) = csv_records(&listing.csv);
+        assert_eq!(rows[0][0], "a,b\"c", "commas and quotes are escaped, not corrupting the row");
+        assert_eq!(rows[0].len(), 7);
+    }
+
+    #[test]
+    fn student_list_with_nothing_recent_says_so_and_still_has_the_csv() {
+        let subs = vec![kaggle_row("old", "b1", "2026-09-01T10:00:00+00:00", 1.0, 1.0)];
+        let config = listing_config(crate::config::CompetitionMode::Kaggle);
+        let listing = build_student_listing(&subs, &config, listing_now()).unwrap();
+        assert!(listing.text.contains("No submits in the last 2 days"), "{}", listing.text);
+        assert!(!listing.text.contains("| Name |"), "no empty table: {}", listing.text);
+        assert_eq!(csv_records(&listing.csv).1.len(), 1);
+    }
+
+    #[test]
+    fn blind_list_hides_the_actual_gain_from_table_and_csv_until_the_reveal() {
+        let subs = vec![blind_row(7, "m1", "2026-10-10T10:00:00+00:00", 100.0, 8675309.5)];
+
+        let hidden_cfg = listing_config(crate::config::CompetitionMode::Blind);
+        let hidden = build_student_listing(&subs, &hidden_cfg, listing_now()).unwrap();
+        let csv = String::from_utf8(hidden.csv.clone()).unwrap();
+        assert!(!hidden.text.contains("8675309") && !csv.contains("8675309"), "{}\n{}", hidden.text, csv);
+        assert!(hidden.text.contains("will be revealed"), "{}", hidden.text);
+        let (header, rows) = csv_records(&hidden.csv);
+        assert_eq!(header, ["id", "name", "submitted_at", "expected_gain", "category", "on_time"]);
+        assert_eq!(rows[0], ["7", "m1", "2026-10-10 07:00:00", "100", "ok", "yes"]);
+
+        let mut revealed_cfg = listing_config(crate::config::CompetitionMode::Blind);
+        revealed_cfg.competition.results_reveal_date = "2000-01-01T00:00:00".to_string();
+        let revealed = build_student_listing(&subs, &revealed_cfg, listing_now()).unwrap();
+        assert!(revealed.text.contains("✨ Actual"), "{}", revealed.text);
+        let (header, rows) = csv_records(&revealed.csv);
+        assert_eq!(header, ["id", "name", "submitted_at", "expected_gain", "actual_gain", "category", "on_time"]);
+        assert_eq!(rows[0][4], "8675309.5");
+        assert!(String::from_utf8(revealed.csv).unwrap().is_ascii());
+    }
+
+    #[test]
+    fn student_list_message_stays_under_the_zulip_limit_however_many_recent_submits() {
+        // 400 submits in the last two days: far more than fit in one message.
+        let subs: Vec<Submission> = (0..400)
+            .map(|i| {
+                let ts = format!("2026-10-10T{:02}:{:02}:00+00:00", 12 - i / 60, 59 - i % 60);
+                kaggle_row(&format!("a-fairly-long-model-name-{i}"), &format!("batch-{i:04}"), &ts, 1.0, 1.0)
+            })
+            .collect();
+        let config = listing_config(crate::config::CompetitionMode::Kaggle);
+        let listing = build_student_listing(&subs, &config, listing_now()).unwrap();
+
+        assert!(
+            listing.text.chars().count() <= LISTING_BUDGET,
+            "{} chars, over the budget Zulip's 10,000 limit leaves",
+            listing.text.chars().count()
+        );
+        let shown = listing.text.matches("|a-fairly-long-model-name-").count();
+        assert!(shown > 0 && shown < 400, "some, not all: {shown}");
+        assert!(
+            listing.text.contains(&format!("…and {} more from these two days, only in the CSV.", 400 - shown)),
+            "the hidden count is stated exactly: {}",
+            listing.text
+        );
+        assert!(listing.text.contains("a-fairly-long-model-name-0|"), "the newest are the ones kept");
+        assert_eq!(csv_records(&listing.csv).1.len(), 400, "the CSV has all of them");
     }
 
     #[test]
